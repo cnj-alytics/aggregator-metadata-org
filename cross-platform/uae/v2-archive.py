@@ -27,6 +27,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import psycopg
@@ -77,6 +78,11 @@ def storage(method, path, body=None):
         try:
             with urlopen(req, timeout=120) as r:
                 return r.read()
+        except HTTPError as e:
+            if e.code in (400, 404) or attempt == 4:  # not found: no point retrying
+                raise
+            log(f"storage {method} {path[:80]} attempt {attempt}: {e}")
+            time.sleep(3 * attempt)
         except Exception as e:  # noqa: BLE001
             if attempt == 4:
                 raise
@@ -133,7 +139,7 @@ def main():
     for b in range(MAX_BATCHES):
         # resume a batch that was claimed but never finished, else claim a new one
         cur.execute("""select archive_run from v2.raw_file where phase = %s and archived_at is null and archive_run is not null
-                       limit 1""", (PHASE,))
+                       and archive_run <> 'missing' limit 1""", (PHASE,))
         row = cur.fetchone()
         if row:
             batch = row[0]
@@ -154,14 +160,29 @@ def main():
         rows = cur.fetchall()
 
         def fetch(r):
-            raw = storage("GET", f"object/authenticated/{staging}/{r[10]}")
+            try:
+                raw = storage("GET", f"object/authenticated/{staging}/{r[10]}")
+            except HTTPError as e:
+                if e.code in (400, 404):  # file not in staging (e.g. being re-scraped right now)
+                    return None
+                raise
             try:
                 return gzip.decompress(raw).decode("utf-8", "replace")
             except OSError:
                 return raw.decode("utf-8", "replace")
 
         with ThreadPoolExecutor(24) as ex:
-            bodies = list(ex.map(fetch, rows))
+            fetched = list(ex.map(fetch, rows))
+        missing = [r[0] for r, b in zip(rows, fetched) if b is None]
+        if missing:
+            # park them: a re-scrape uploads a fresh copy and v2_raw_record clears archive_run again
+            cur.execute("update v2.raw_file set archive_run = 'missing' where archive_run = %s and id = any(%s)", (batch, missing))
+            log(f"batch {batch}: {len(missing)} files not in staging - parked until re-scraped")
+        keep = [(r, b) for r, b in zip(rows, fetched) if b is not None]
+        if not keep:
+            continue
+        rows = [r for r, _ in keep]
+        bodies = [b for _, b in keep]
 
         cols = list(zip(*rows))
         data = pa.table({
@@ -199,8 +220,9 @@ def main():
             sys.exit(f"batch {batch}: wrote {len(rows)} but Iceberg returned {got} - stopping, staging kept")
 
         ids = list(cols[0])
-        cur.execute("update v2.raw_file set archived_at = now() where archive_run = %s and id = any(%s)", (batch, ids))
-        paths = list(cols[10])
+        # only rows still in this batch: a file re-scraped meanwhile left the batch and its new copy must stay
+        cur.execute("update v2.raw_file set archived_at = now() where archive_run = %s and id = any(%s) returning path", (batch, ids))
+        paths = [p for (p,) in cur.fetchall()]
         for i in range(0, len(paths), 500):
             storage("DELETE", f"object/{staging}", {"prefixes": paths[i:i + 500]})
         total += len(rows)
