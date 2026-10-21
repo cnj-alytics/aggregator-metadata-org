@@ -163,10 +163,39 @@ function extract(platform, j) {
   }
   return null;
 }
+// images + cuisines + description, branch level and brand level
+const NOON_CDN = 'https://f.nooncdn.com/';
+const noonImg = (p) => (typeof p === 'string' && p ? (/^https?:/.test(p) ? p : NOON_CDN + p.replace(/^\//, '')) : null);
+const strList = (a, f) => (Array.isArray(a) ? a.map(f).filter((x) => typeof x === 'string' && x).slice(0, 20) : null);
+function media(platform, j) {
+  if (!j) return {};
+  if (platform === 'talabat') {
+    const V = j?.vendor?.result || {}, R = V.restaurant || {};
+    return { logo_url: str(R.logoUrl), cover_url: str(V.hImgUrl), brand_logo_url: str(R.logoUrl),
+      cuisines: strList(R.cus, (c) => c && c.na) || (R.css ? String(R.css).split(',').map((s) => s.trim()).filter(Boolean) : null) };
+  }
+  if (platform === 'careem') {
+    return { logo_url: str(j.logo_url), cover_url: str(j.image_url), brand_logo_url: str(j.brand?.image_url),
+      cuisines: strList(j.cuisines, (c) => c && c.name), description: str(j.description) };
+  }
+  if (platform === 'deliveroo') {
+    const M = j?.menuPage?.menu || {};
+    return { cover_url: str(M.header?.image?.url), logo_url: null, brand_logo_url: null,
+      description: str(M.metas?.root?.metatags?.descriptionSocial) };
+  }
+  if (platform === 'noon') {
+    const D = j?.data || {};
+    const logo = noonImg(D.media?.logoImage || D.logoImage);
+    return { logo_url: logo, cover_url: noonImg(D.media?.heroImage || (D.media?.images || [])[0] || (D.images || [])[0]), brand_logo_url: logo,
+      cuisines: strList(D.cuisines, (c) => (typeof c === 'string' ? c : c && c.name)) };
+  }
+  return {};
+}
 async function saveExtract(item, outcome) {
   const raw = lastRaw.get(`${item.platform}:${item.branch_key}`) || {};
   let f = null;
   try { f = extract(item.platform, raw.json); } catch (e) { log(`extract failed: ${e.message}`); }
+  if (f) { try { Object.assign(f, media(item.platform, raw.json)); } catch (e) { log(`media failed: ${e.message}`); } }
   await rpc('v2_detail_save_extract', { p_run: RUN_ID, p_machine: MACHINE, p_platform: item.platform, p_key: String(item.branch_key),
     p_http: raw.status ?? null, p_outcome: f ? outcome : (outcome === 'done' ? 'no_fields' : outcome), p_f: f || {}, p_raw_path: raw.path || null });
 }
