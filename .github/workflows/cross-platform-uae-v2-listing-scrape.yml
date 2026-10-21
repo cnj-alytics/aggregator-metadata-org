@@ -1,0 +1,43 @@
+name: Cross-platform UAE – v2 Listing Scrape (started by Supabase)
+run-name: v2 listing run ${{ inputs.run_id }} job ${{ inputs.job_no }}
+
+# v2 rebuild. One machine = one job = one app at one area point.
+# Saves every listing response untouched to Supabase v2.listing_page.
+# Started by: select v2_listing_dispatch(<run_id>);
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'v2.listing_run.run_id'
+        required: true
+        type: string
+      job_no:
+        description: 'v2.listing_job.job_no'
+        required: true
+        type: string
+
+concurrency:
+  group: v2-listing-run-${{ inputs.run_id }}-job-${{ inputs.job_no }}
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    name: run ${{ inputs.run_id }} job ${{ inputs.job_no }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: cross-platform/uae
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run v2 listing scrape
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_ID: ${{ inputs.run_id }}
+          JOB_NO: ${{ inputs.job_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: node cross-platform/uae/v2-listing-scrape.js
