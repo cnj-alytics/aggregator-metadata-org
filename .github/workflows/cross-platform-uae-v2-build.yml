@@ -1,0 +1,40 @@
+name: Cross-platform UAE – v2 Hierarchy Build
+
+# v2 phase 4. Runs the whole hierarchy build (public.v2b_build_all) over a direct
+# database connection, so no step is cut off by the API timeout. Each build writes a
+# new schema v2b_<n>; the views in v2b point at the newest finished build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 'Label stored in v2b.build_log'
+        type: string
+        default: 'full run'
+
+concurrency:
+  group: v2-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Install
+        run: pip install --quiet "psycopg[binary]==3.3.6"
+      - name: Build
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          NOTE: ${{ inputs.note }}
+        run: |
+          python - <<'PY'
+          import json, os, psycopg
+          with psycopg.connect(os.environ["SUPABASE_DB_URL"], autocommit=True) as c:
+              c.execute("set statement_timeout = 0")
+              c.execute("call public.v2b_build_all(%s)", (os.environ["NOTE"],))
+              r = c.execute("select build_id, schema_name, status, steps from v2b.build_log order by build_id desc limit 1").fetchone()
+              print(json.dumps({"build_id": r[0], "schema": r[1], "status": r[2], "steps": r[3]}, indent=2, default=str))
+              if r[2] != "done":
+                  raise SystemExit("build did not finish")
+          PY
