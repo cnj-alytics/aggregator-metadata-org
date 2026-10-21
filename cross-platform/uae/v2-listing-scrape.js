@@ -116,10 +116,11 @@ async function careem(job) {
   let sub = '';
   try { sub = JSON.parse(Buffer.from(tok.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')).sub || ''; } catch (_) {}
   let cards = 0;
-  for (let page = 1; page <= 150; page++) {
+  // Follow Careem's own next_page_url (it carries sp_offset + the already-shown brand bitmap).
+  let next = '/v1/page/food-discovery-home/component/v/1/food-discovery-all-restaurants-v2?sp_page=1&sp_offset=0&sp_category=food_disc_all_restaurants';
+  for (let page = 1; page <= 400 && next; page++) {
     const sess = 'V2LS-' + crypto.randomBytes(4).toString('hex').toUpperCase();
-    const url = 'https://appengine.careemapis.com/v1/page/food-discovery-home/component/v/1/food-discovery-all-restaurants-v2' +
-      `?sp_page=${page}&sp_offset=0&sp_category=food_disc_all_restaurants`;
+    const url = 'https://appengine.careemapis.com' + next;
     const headers = {
       SESSION_ID: sess, 'X-Careem-Beta': 'false', 'User-Agent': 'ICMA/26.39.0', 'X-Careem-Agent': 'ICMA',
       'X-Careem-Session-Id': sess, Agent: 'ICMA', 'Time-Zone': 'Asia/Dubai', lng: String(job.lng), lat: String(job.lat),
@@ -134,6 +135,7 @@ async function careem(job) {
     if (r.status !== 200) throw new Error(`careem HTTP ${r.status}`);
     const n = careemCards(j).length;
     cards += n;
+    next = j && typeof j.next_page_url === 'string' && j.next_page_url ? j.next_page_url : null;
     if (!n) break;
     await sleep(1000);
   }
