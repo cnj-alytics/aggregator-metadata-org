@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 // cross-platform/uae/v2-detail-scrape.js
 //
-// v2 restaurant detail scrape. One GitHub Actions run = one machine.
+// v2 phase 3: restaurant page scrape. One GitHub Actions run = one machine.
 // Supabase (v2_detail_* functions) is the controller: it hands out one restaurant
-// at a time from v2.detail_queue; this machine fetches that restaurant's FULL raw
-// page from the app (viewed from the fixed point where it was listed) and saves it
-// untouched to v2.detail_raw immediately. After jobs_per_machine restaurants it
-// exits and Supabase starts a fresh machine (fresh IP). 403/429 = stop this machine.
+// at a time from v2.detail_queue (unique app listings only); this machine fetches
+// that restaurant's FULL raw page (viewed from the area pin where it was listed),
+// parks it gzipped in Supabase Storage (v2-staging, recorded in v2.raw_file) and
+// saves only the extracted fields + menu item names to v2.detail_extract.
+// After jobs_per_machine restaurants it exits and Supabase starts a fresh machine.
+// 403/429 = stop this machine.
 //
 // Endpoints (full responses, nothing trimmed):
 //   talabat   GET  api.talabat.com/menubff/v4/branches/{bid}/menu
@@ -19,6 +21,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -65,16 +68,107 @@ async function http(url, opts = {}) {
   return { resp, status: resp.status, text, elapsed: Date.now() - t0 };
 }
 
-// save -> v2.detail_raw ; returns parsed json (or null)
+let BUCKET = 'v2-staging';
+const lastRaw = new Map(); // `${platform}:${key}` -> { status, path, json }
+
+async function putRaw(objectPath, text) {
+  const gz = zlib.gzipSync(Buffer.from(text || '', 'utf8'));
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const resp = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}/${objectPath}`, {
+        method: 'POST',
+        headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/gzip', 'x-upsert': 'true' },
+        body: gz, signal: AbortSignal.timeout(120_000),
+      });
+      if (!resp.ok) throw new Error(`storage ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+      return gz.length;
+    } catch (e) {
+      if (attempt >= 4) throw e;
+      log(`upload attempt ${attempt} failed: ${e.message} - retrying`);
+      await sleep(3_000 * attempt);
+    }
+  }
+}
+const safe = (k) => String(k).replace(/[^A-Za-z0-9_.-]/g, '_');
+
+// save -> raw page parked in Storage (+ v2.raw_file row); returns parsed json (or null)
 async function save(item, endpoint, r, request, jsonOverride) {
   let json = jsonOverride !== undefined ? jsonOverride : null;
   if (jsonOverride === undefined) { try { json = r.text ? JSON.parse(r.text) : null; } catch (_) { json = null; } }
-  await rpc('v2_detail_save', {
-    p_run: RUN_ID, p_machine: MACHINE, p_platform: item.platform, p_key: item.branch_key, p_endpoint: endpoint,
-    p_http: r.status, p_body: json, p_body_text: json === null ? (r.text || null) : null,
-    p_bytes: r.text ? Buffer.byteLength(r.text) : 0, p_ms: r.elapsed, p_request: request,
+  const text = json !== null ? JSON.stringify(json) : (r.text || '');
+  const objectPath = `detail/${item.platform}/${safe(item.branch_key)}/run${RUN_ID}-${endpoint}.json.gz`;
+  const gzBytes = await putRaw(objectPath, text);
+  await rpc('v2_raw_record', {
+    p_phase: 'detail', p_run: RUN_ID, p_job: null, p_machine: MACHINE, p_platform: item.platform, p_listing_id: String(item.branch_key),
+    p_seq: 1, p_kind: endpoint, p_http: r.status, p_bytes: Buffer.byteLength(text), p_gz: gzBytes, p_path: objectPath,
+    p_request: { ...request, ms: r.elapsed },
   });
+  lastRaw.set(`${item.platform}:${item.branch_key}`, { status: r.status, path: objectPath, json });
   return json;
+}
+
+// -- field extraction (what the build needs; the full page stays in the archive) --
+const str = (v) => (v === null || v === undefined || v === '' ? null : String(v));
+const e7 = (v) => { const n = fnum(v); return n === null ? null : (Math.abs(n) > 1000 ? n / 1e7 : n); };
+const fnum = (v) => (v === null || v === undefined || v === '' || isNaN(Number(v)) ? null : Number(v));
+function menuNames(names) {
+  const out = new Set();
+  for (const n of names) {
+    if (typeof n !== 'string') continue;
+    const t = n.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    if (t.length >= 3) out.add(t);
+    if (out.size >= 800) break;
+  }
+  return [...out];
+}
+function findPin(x, d = 0) {
+  if (!x || d > 40 || typeof x !== 'object') return null;
+  if (Array.isArray(x)) { for (const v of x) { const p = findPin(v, d + 1); if (p) return p; } return null; }
+  if (Array.isArray(x.pins) && x.pins.length && x.pins[0] && x.pins[0].lat != null) return { lat: fnum(x.pins[0].lat), lng: fnum(x.pins[0].lon ?? x.pins[0].lng) };
+  for (const k of Object.keys(x)) { if (x[k] && typeof x[k] === 'object') { const p = findPin(x[k], d + 1); if (p) return p; } }
+  return null;
+}
+function extract(platform, j) {
+  if (!j) return null;
+  if (platform === 'talabat') {
+    const R = j?.vendor?.result?.restaurant; if (!R) return null;
+    const items = [];
+    for (const sec of j?.menu?.result?.menu?.menuSection || []) for (const it of sec.itm || []) items.push(it.nm);
+    return { branch_key: str(R.bid), name: str(R.bna), brand_id: R.gid && Number(R.gid) !== 0 ? str(R.gid) : null, brand_name: str(R.na),
+      account_id: str(R.id), owner_name: str(R.brandLegalName), lat: fnum(R.lat), lng: fnum(R.lon), area: str(R.an), menu: menuNames(items) };
+  }
+  if (platform === 'careem') {
+    const items = [];
+    for (const g of j?.menu?.groups || []) for (const it of g.items || []) items.push(it.item);
+    return { branch_key: str(j.id), name: str(j.name), brand_id: str(j.brand?.id ?? j.brand_id), brand_name: str(j.brand?.name),
+      account_id: str(j.contract_id), phone: str(j.contact?.phone), lat: fnum(j.coordinate?.lat), lng: fnum(j.coordinate?.lng),
+      area: str(j.location), menu: menuNames(items) };
+  }
+  if (platform === 'deliveroo') {
+    const root = j?.menuPage?.menu?.metas?.root; const R = root?.restaurant; if (!R) return null;
+    const pin = findPin(j?.menuPage?.menu?.layoutGroups) || {};
+    const loc = R.location || {};
+    return { branch_key: str(R.drnId), name: str(R.name), brand_id: str(R.brandDrnId), account_id: str(R.id),
+      address: str(loc.address?.address1), area: str(loc.address?.neighborhood), zone: str(loc.zoneId), lat: pin.lat ?? null, lng: pin.lng ?? null,
+      menu: menuNames((root.items || []).map((i) => i.name)), extra: { menu_disabled: R.menuDisabled ?? null, uname: R.uname ?? null } };
+  }
+  if (platform === 'noon') {
+    const D = j?.data; if (!D) return null;
+    const logo = typeof D.logoImage === 'string' ? D.logoImage : (D.media?.logoImage || '');
+    const partner = (/partner_(\d+)/.exec(logo || '') || [])[1] || null;
+    const addr = typeof D.address === 'string' ? D.address : (D.address?.text || D.address?.addressLine || (D.address ? JSON.stringify(D.address) : null));
+    return { branch_key: str(D.outletCode), name: str(D.name), brand_id: str(D.restaurantCode), brand_name: str(D.name), account_id: str(D.menuCode),
+      owner_id: partner, phone: str(D.phone), lat: e7(D.outletLat), lng: e7(D.outletLng), address: str(addr),
+      menu: menuNames((D.menu?.items || []).map((i) => i.name)) };
+  }
+  return null;
+}
+async function saveExtract(item, outcome) {
+  const raw = lastRaw.get(`${item.platform}:${item.branch_key}`) || {};
+  let f = null;
+  try { f = extract(item.platform, raw.json); } catch (e) { log(`extract failed: ${e.message}`); }
+  await rpc('v2_detail_save_extract', { p_run: RUN_ID, p_machine: MACHINE, p_platform: item.platform, p_key: String(item.branch_key),
+    p_http: raw.status ?? null, p_outcome: f ? outcome : (outcome === 'done' ? 'no_fields' : outcome), p_f: f || {}, p_raw_path: raw.path || null });
 }
 
 // -- geohash (Deliveroo views the page from the listing point) --------------
@@ -218,6 +312,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, async () => { await end
 (async () => {
   const st = await rpc('v2_detail_machine_start', { p_run: RUN_ID, p_machine: MACHINE, p_gh: GH_RUN_ID });
   if (!st || st.stop) { log(`not starting: ${st && st.reason}`); return; }
+  try { const b = await rpc('v2_setting', { p_key: 'staging_bucket' }); if (typeof b === 'string' && b) BUCKET = b; } catch (_) {}
   const jobs = Number(st.jobs) || 40, delay = Number(st.delay_ms) || 800;
   let exitReason = 'job quota reached', done = 0;
   for (let j = 0; j < jobs; j++) {
@@ -228,6 +323,10 @@ for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, async () => { await end
     let outcome, err = null;
     try { outcome = await FETCH[item.platform](item); }
     catch (e) { outcome = e instanceof Blocked ? 'blocked' : 'error'; err = String(e.message).slice(0, 400); }
+    if (outcome === 'done' || outcome === 'unavailable') {
+      try { await saveExtract(item, outcome); } catch (e) { outcome = 'error'; err = `save extract: ${String(e.message).slice(0, 300)}`; }
+    }
+    lastRaw.delete(`${item.platform}:${item.branch_key}`);
     const rep = await rpc('v2_detail_report', { p_run: RUN_ID, p_machine: MACHINE, p_platform: item.platform, p_key: item.branch_key, p_outcome: outcome, p_error: err });
     current = null; done++;
     log(`${item.platform} ${item.branch_key}: ${outcome}${err ? ' | ' + err : ''}`);
