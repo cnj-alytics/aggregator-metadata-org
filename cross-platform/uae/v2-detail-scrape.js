@@ -344,9 +344,11 @@ for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, async () => { await end
   try { const b = await rpc('v2_setting', { p_key: 'staging_bucket' }); if (typeof b === 'string' && b) BUCKET = b; } catch (_) {}
   const jobs = Number(st.jobs) || 40, delay = Number(st.delay_ms) || 800;
   let exitReason = 'job quota reached', done = 0;
+  const skip = new Set(); // apps that refused this machine's IP (403/429): keep working on the others
   for (let j = 0; j < jobs; j++) {
     if (Date.now() - START > WALL_LIMIT_MS) { exitReason = 'wall limit'; break; }
-    const item = await rpc('v2_detail_claim', { p_run: RUN_ID, p_machine: MACHINE });
+    if (skip.size >= 4) { exitReason = 'blocked (403/429) on all apps'; break; }
+    const item = await rpc('v2_detail_claim', { p_run: RUN_ID, p_machine: MACHINE, p_skip: [...skip] });
     if (!item || item.stop) { exitReason = (item && item.reason) || 'nothing to claim'; break; }
     current = item;
     let outcome, err = null;
@@ -359,7 +361,8 @@ for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, async () => { await end
     const rep = await rpc('v2_detail_report', { p_run: RUN_ID, p_machine: MACHINE, p_platform: item.platform, p_key: item.branch_key, p_outcome: outcome, p_error: err });
     current = null; done++;
     log(`${item.platform} ${item.branch_key}: ${outcome}${err ? ' | ' + err : ''}`);
-    if (outcome === 'blocked' || (rep && rep.action === 'stop')) { exitReason = 'blocked (403/429)'; break; }
+    if (outcome === 'blocked') { skip.add(item.platform); log(`skipping ${item.platform} on this machine from now on`); j--; continue; }
+    if (rep && rep.action === 'stop') { exitReason = 'stopped by controller'; break; }
     if (j < jobs - 1) await sleep(delay);
   }
   await endMachine(exitReason);
