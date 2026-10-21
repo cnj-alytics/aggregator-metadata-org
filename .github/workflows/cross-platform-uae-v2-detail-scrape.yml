@@ -1,0 +1,43 @@
+name: Cross-platform UAE – v2 Detail Scrape (started by Supabase)
+run-name: v2 detail run ${{ inputs.run_id }} m${{ inputs.machine_no }}
+
+# v2 rebuild. One machine; Supabase hands it restaurants one at a time from
+# v2.detail_queue and keeps the pool full. Full raw pages saved to v2.detail_raw.
+# Start: select v2_detail_start();  Stop: select v2_detail_stop();
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'v2.detail_run.run_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'v2.detail_machine.machine_no'
+        required: true
+        type: string
+
+concurrency:
+  group: v2-detail-run-${{ inputs.run_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    name: run ${{ inputs.run_id }} machine ${{ inputs.machine_no }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: cross-platform/uae
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run v2 detail scrape
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_ID: ${{ inputs.run_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: node cross-platform/uae/v2-detail-scrape.js
