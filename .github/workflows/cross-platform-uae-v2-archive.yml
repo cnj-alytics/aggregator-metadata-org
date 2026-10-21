@@ -1,0 +1,52 @@
+name: Cross-platform UAE – v2 Archive (staging -> Iceberg)
+
+# v2 phase 5. Moves raw pages from Supabase Storage (v2-staging) into the v2 analytics
+# bucket (Iceberg: v2_raw.detail_pages / v2_raw.listing_pages). Each batch is read back
+# and verified before its staged files are removed. Safe to re-run at any time.
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: 'detail or listing'
+        type: choice
+        options: [detail, listing]
+        default: detail
+      max_batches:
+        description: 'Stop after this many batches (1500 pages each)'
+        type: string
+        default: '1000'
+      dry_run:
+        description: 'Only count what is waiting'
+        type: boolean
+        default: false
+
+concurrency:
+  group: v2-archive-${{ inputs.phase }}
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: cross-platform/uae
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --quiet "pyiceberg[pyarrow]==0.12.0" "psycopg[binary]==3.3.6"
+      - name: Archive
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_S3_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+          SUPABASE_S3_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
+          SUPABASE_S3_REGION: ap-southeast-2
+          PHASE: ${{ inputs.phase }}
+          MAX_BATCHES: ${{ inputs.max_batches }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: python cross-platform/uae/v2-archive.py
