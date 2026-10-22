@@ -204,18 +204,34 @@ def main():
         }, schema=ARROW_SCHEMA)
 
         flt = EqualTo("archive_batch", batch)
-        for attempt in range(1, 4):
-            try:
-                table.overwrite(data, overwrite_filter=flt)
-                break
-            except Exception as e:  # noqa: BLE001  (retrying the same overwrite is safe)
-                if attempt == 3:
-                    raise
-                log(f"overwrite attempt {attempt} failed: {e}")
-                time.sleep(10 * attempt)
-                table.refresh()
-        table.refresh()
-        got = table.scan(row_filter=flt, selected_fields=("raw_id",)).to_arrow().num_rows
+
+        def batch_rows():
+            # reads only the raw_id column, so it stays cheap however big the table gets
+            table.refresh()
+            return table.scan(row_filter=flt, selected_fields=("raw_id",)).to_arrow().num_rows
+
+        # An append is one atomic commit: a batch is either fully in Iceberg or not at all.
+        # So a resumed batch is checked first and only appended if it is not there yet.
+        # (overwrite() had to read every older file to apply its filter and ran out of memory.)
+        already = batch_rows()
+        if already and already != len(rows):
+            sys.exit(f"batch {batch}: Iceberg already has {already} rows but the batch has {len(rows)} - stopping, staging kept")
+        if not already:
+            for attempt in range(1, 4):
+                try:
+                    table.append(data)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if attempt == 3:
+                        raise
+                    log(f"append attempt {attempt} failed: {e}")
+                    time.sleep(10 * attempt)
+                    if batch_rows():  # the commit landed before the error came back
+                        break
+        else:
+            log(f"batch {batch}: already in Iceberg ({already} rows) - not written again")
+        del data, bodies, keep, fetched
+        got = batch_rows()
         if got != len(rows):
             sys.exit(f"batch {batch}: wrote {len(rows)} but Iceberg returned {got} - stopping, staging kept")
 
