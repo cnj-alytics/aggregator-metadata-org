@@ -8,8 +8,8 @@
 // parks it gzipped in Supabase Storage (v2-staging, recorded in v2.raw_file) and
 // saves only the extracted fields + menu item names to v2.detail_extract.
 // After jobs_per_machine restaurants it exits and Supabase starts a fresh machine.
-// 429/403 = back off on THIS machine (60 s, 120 s, 180 s, 240 s) and retry, as the v1 register-branch job
-// does; only if it is still refused does the machine drop that app, and Supabase slows the whole run.
+// 429/403 = as the v1 ranking scrape does: this machine stops at once, the restaurant goes back in the
+// queue, and Supabase starts a fresh machine (new runner, new IP) in its place.
 // Pace between restaurants comes from Supabase (delay_ms on every claim) with +-30% jitter.
 //
 // Endpoints (full responses, nothing trimmed):
@@ -72,7 +72,7 @@ async function http(url, opts = {}) {
 
 // http() with the v1 back-off: on 429/403 wait 60 s, 120 s, 180 s, 240 s on this machine and try again.
 // Gives up (throws Blocked) only after the last wait, or when the machine's time is nearly used.
-const BACKOFF_MS = [60_000, 120_000, 180_000, 240_000];
+const BACKOFF_MS = []; // no waiting on this machine: a 429 ends it and Supabase replaces it
 async function httpBackoff(url, opts = {}) {
   for (let i = 0; ; i++) {
     try { return await http(url, opts); }
@@ -403,7 +403,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, async () => { await end
     const rep = await rpc('v2_detail_report', { p_run: RUN_ID, p_machine: MACHINE, p_platform: item.platform, p_key: item.branch_key, p_outcome: outcome, p_error: err });
     current = null; done++;
     log(`${item.platform} ${item.branch_key}: ${outcome}${err ? ' | ' + err : ''}`);
-    if (outcome === 'blocked') { skip.add(item.platform); log(`skipping ${item.platform} on this machine from now on`); j--; continue; }
+    if (outcome === 'blocked') { exitReason = `${err} - replaced`; log('refused - ending this machine; Supabase starts a fresh one'); break; }
     if (rep && rep.action === 'stop') { exitReason = 'stopped by controller'; break; }
     // pace set by Supabase (it slows the run after a refusal), with +-30% jitter so machines don't fire in step
     const pace = Number(item.delay_ms) || delay;
