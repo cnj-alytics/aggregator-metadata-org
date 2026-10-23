@@ -15,7 +15,8 @@
 // Endpoints (full responses, nothing trimmed):
 //   talabat   GET  api.talabat.com/menubff/v4/branches/{bid}/menu
 //   careem    GET  apigateway.careemdash.com/v1/restaurants/{merchant_id}   (v2's own token pool)
-//   deliveroo GET  {menu page}?geohash={point}  -> __NEXT_DATA__ (menuPage + query saved)
+//   deliveroo POST co-m.ae.deliveroo.com/consumer/graphql/ (app: is it listed at its location?) then, if live,
+//             GET  {menu page from the app}?geohash={point}  -> __NEXT_DATA__ (menuPage + query saved)
 //   noon      POST outlet/details/guest/partial (guest token minted on this machine)
 //
 // Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, RUN_ID, MACHINE_NO, GITHUB_RUN_ID
@@ -166,7 +167,12 @@ function extract(platform, j) {
       area: str(j.location), menu: menuNames(items) };
   }
   if (platform === 'deliveroo') {
-    const root = j?.menuPage?.menu?.metas?.root; const R = root?.restaurant; if (!R) return null;
+    const root = j?.menuPage?.menu?.metas?.root; const R = root?.restaurant;
+    if (!R) {
+      const A = j?.app?.found; if (!A) return null;
+      return { branch_key: null, name: str(A.name), account_id: str(A.id), lat: fnum(A.lat), lng: fnum(A.lng), menu: [],
+        extra: { live_in_app: true, delivery_status: A.delivery_status ?? null, app_href: A.href ?? null, app_check: j.app.how } };
+    }
     const pin = findPin(j?.menuPage?.menu?.layoutGroups) || {};
     const loc = R.location || {};
     // dishes only: an item filed under one of the menu's categories (add-on options sit in the same items list)
@@ -175,7 +181,8 @@ function extract(platform, j) {
     for (const i of root.items || []) { if (i && cats.has(i.categoryId) && !seen.has(i.id)) { seen.add(i.id); dishes.push(i.name); } }
     return { branch_key: str(R.drnId), name: str(R.name), brand_id: str(R.brandDrnId), account_id: str(R.id),
       address: str(loc.address?.address1), area: str(loc.address?.neighborhood), zone: str(loc.zoneId), lat: pin.lat ?? null, lng: pin.lng ?? null,
-      menu: menuNames(dishes), extra: { menu_disabled: R.menuDisabled ?? null, uname: R.uname ?? null } };
+      menu: menuNames(dishes), extra: { menu_disabled: R.menuDisabled ?? null, uname: R.uname ?? null, live_in_app: j?.app?.found ? true : null,
+        delivery_status: j?.app?.found?.delivery_status ?? null, app_href: j?.app?.found?.href ?? null } };
   }
   if (platform === 'noon') {
     const D = j?.data; if (!D) return null;
@@ -275,15 +282,65 @@ async function careem(item) {
 }
 
 // -- Deliveroo ----------------------------------------------------------------
-async function deliveroo(item) {
-  if (!item.page_url) {
-    await save(item, 'menu_page_next_data', { status: null, text: null, elapsed: 0 }, { note: 'no page url known' }, null);
-    return 'unavailable';
+// Step 1 is the Deliveroo app (mobile GraphQL, the same endpoint and headers as the v1 hourly ranking scrape,
+// which runs on 100+ machines a day without 429s): is the restaurant in the app at its own location?
+//   a) text search for its name there, then b) if not found, the full app listing there (unavailable ones included).
+// Found -> live: the app gives its web page path, which is opened (step 2) for the menu.
+// Not found by either -> not live on Deliveroo (no website request at all).
+const ROO_GQL = 'https://co-m.ae.deliveroo.com/consumer/graphql/';
+const ROO_CAPS = {"fulfillment_methods": ["DELIVERY", "COLLECTION"], "ui_actions": ["CHANGE_DELIVERY_TIME", "CLEAR_FILTERS", "NO_DELIVERY_YET", "SHOW_MEAL_CARD_ISSUERS", "SHOW_PLUS_SIGN_UP", "TOGGLE_FAVOURITE", "COPY_TO_CLIPBOARD", "REFRESH", "SUBSCRIBE_FREE_PLUS", "REQUEST_RESTAURANT"], "ui_blocks": ["BANNER", "SHORTCUT", "CARD", "BUTTON", "MERCHANDISING_CARD", "DIVIDER", "STORY_CARD", "ROO_BLOCK"], "ui_controls": ["APPLIED_FILTER", "FILTER", "LAYOUT_GROUP", "QUERY_RESULT", "SORT", "TABS", "SORTING_AND_FILTERING", "TABBAR"], "ui_features": ["UI_CAROUSEL_COLOR", "UI_CARD_BORDER", "UI_PROMOTION_TAG", "ILLUSTRATION_BADGES", "SCHEDULED_RANGES", "LIMIT_QUERY_RESULTS", "UI_SPAN_COUNTDOWN", "HOME_MAP_VIEW", "UNAVAILABLE_RESTAURANTS", "UI_CARD_BADGES", "CARD_ILLUSTRATION_BADGE", "UI_CAROUSEL_BACKGROUND_IMAGE", "UI_SPAN_TAGS"], "ui_layout_carousel_styles": ["DEFAULT"], "ui_layouts": ["LIST", "CAROUSEL"], "ui_lines": ["TEXT", "TITLE", "BULLET"], "ui_targets": ["ACTION", "LAYOUT_GROUP", "PARAMS", "RESTAURANT", "WEB_PAGE", "DEEP_LINK", "MENU_ITEM", "EDITORIAL_CONTENT"], "ui_themes": ["BANNER_EMPTY", "BANNER_MARKETING_A", "BANNER_MARKETING_B", "BANNER_MARKETING_C", "BANNER_PICKUP_SHOWCASE", "BANNER_SERVICE_ADVISORY", "SHORTCUT_DEFAULT", "SHORTCUT_STACKED", "CARD_LARGE_V2", "CARD_MEDIUM_V2", "CARD_MEDIUM_HORIZONTAL", "CARD_SMALL", "CARD_SMALL_DIAGONAL", "CARD_SMALL_HORIZONTAL", "CARD_WIDE", "CARD_ROW_LARGE", "BUTTON_PRIMARY", "BUTTON_SECONDARY", "MODAL_DEFAULT", "MODAL_PLUS", "MODAL_PLUS_INVITE", "MODAL_BUTTON_PRIMARY", "MODAL_BUTTON_SECONDARY", "MODAL_BUTTON_TERTIARY", "BANNER_CARD", "CARD_TALL", "CARD_TALL_GRADIENT", "MERCHCARD_DEFAULT", "MERCHCARD_FULL_IMAGE", "MODAL_MERCHANDISING", "MODAL_PROMOTIONAL", "MODAL_ROOBLOCK", "ANY_MODAL", "MODAL_PLUS_FULL_SCREEN"]};
+const ROO_R = 'id drn_id name delivery_status lat lon distance_meters links { self { href } }';
+const ROO_B = `ui_blocks { __typename ... on UICard { target { __typename ... on UITargetRestaurant { restaurant { ${ROO_R} } } } } }`;
+const rooQuery = (op) => `query T($options: SearchOptionsInput, $location: LocationInput!, $uuid: String!, $capabilities: Capabilities) { ${op}(location: $location, options: $options, uuid: $uuid, capabilities: $capabilities) { ui_layout_groups { ui_layouts { __typename ... on UILayoutList { ${ROO_B} } ... on UILayoutCarousel { ${ROO_B} } } } } }`;
+const ROO_BASE = { fulfillment_include_asap_days: true, web_column_count: 1 };
+function rooHeaders() {
+  const g = crypto.randomUUID().toUpperCase();
+  return { 'User-Agent': 'Deliveroo-OrderApp/3.342.0 (iPhone18,2; iOS27.0.1; Release; en_US; 697347)', 'X-Roo-App-Version': '3.342.0',
+    'X-Roo-Sticky-Guid': g, 'X-Roo-Guid': g, 'X-Roo-Country': 'ae', 'X-Roo-Platform': 'iOS', 'X-Roo-External-Device-Id': crypto.randomUUID().toUpperCase(),
+    'X-Roo-Rooblocks-Version': '5.3.0', 'apollographql-client-name': 'com.deliveroo.orderapp-apollo-ios', 'apollographql-client-version': '3.342.0-697347',
+    'X-APOLLO-OPERATION-NAME': 'T', 'X-APOLLO-OPERATION-TYPE': 'query', Accept: 'multipart/mixed;deferSpec=20220824,application/json',
+    'Content-Type': 'application/json', 'Accept-Language': 'en-US' };
+}
+async function rooSearch(op, lat, lng, options) {
+  const body = { operationName: 'T', query: rooQuery(op), variables: { uuid: crypto.randomUUID().toUpperCase(), capabilities: ROO_CAPS,
+    location: { country_iso_code: 'AE', lat, lon: lng }, options } };
+  const r = await http(ROO_GQL, { method: 'POST', headers: rooHeaders(), body: JSON.stringify(body) });
+  if (r.status !== 200) throw new Error(`deliveroo app HTTP ${r.status}`);
+  let j; try { j = JSON.parse(r.text); } catch (_) { throw new Error('deliveroo app: unreadable reply'); }
+  if (j.errors && !j.data?.[op]) throw new Error(`deliveroo app: ${String(j.errors[0]?.message || 'error').slice(0, 120)}`);
+  const out = [];
+  for (const g of j.data?.[op]?.ui_layout_groups || []) for (const l of g.ui_layouts || []) for (const b of l.ui_blocks || []) {
+    const x = b?.target?.restaurant; if (x && x.drn_id) out.push(x);
   }
-  // View the page as a customer in the restaurant's own delivery areas (nearest 3, from v1), like the v1
-  // register-branch job and dash_menu_live. Deliveroo only shows the menu to an address it delivers to;
-  // otherwise it redirects to the area listing. Falls back to the restaurant pin when no areas are known.
-  const ghs = Array.isArray(item.geohashes) && item.geohashes.length ? item.geohashes.slice(0, 3) : [geohash(Number(item.lat), Number(item.lng))];
+  return out;
+}
+
+async function deliveroo(item) {
+  const lat = Number(item.lat), lng = Number(item.lng);
+  const app = { checked_at: new Date().toISOString(), lat, lng, name_searched: item.name || null, results: 0, how: null, found: null };
+  if (Number.isFinite(lat) && Number.isFinite(lng)) {
+    let found = null;
+    if (item.name) {
+      const rs = await rooSearch('text_search', lat, lng, { ...ROO_BASE, query: String(item.name), search_button_pressed: true });
+      app.results += rs.length; found = rs.find((x) => x.drn_id === item.branch_key); app.how = 'name search';
+    }
+    if (!found) {
+      if (item.name) await sleep(1_500 + Math.random() * 1_000);
+      const rs = await rooSearch('search', lat, lng, { ...ROO_BASE, params: [{ id: 'collection', value: ['restaurants', 'all-restaurants'] }] });
+      app.results += rs.length; found = rs.find((x) => x.drn_id === item.branch_key); app.how = 'area listing';
+    }
+    if (found) app.found = { id: str(found.id), name: found.name, delivery_status: found.delivery_status, lat: found.lat, lng: found.lon,
+      distance_m: found.distance_meters, href: found.links?.self?.href || null };
+    if (!found) {
+      await save(item, 'app_search', { status: 200, text: null, elapsed: 0 }, { method: 'POST', url: ROO_GQL, lat, lng, name: item.name || null }, { app });
+      return 'unavailable';
+    }
+  }
+  // Step 2: live in the app (or no coordinates) -> the web menu page, at the path the app gives (falls back to the stored URL)
+  const href = app.found?.href ? String(app.found.href).split('?')[0] : null;
+  const pageUrl = href ? 'https://deliveroo.ae/en' + href.split('/').map((p) => encodeURIComponent(decodeURIComponent(p).toLowerCase().replace(/\s+/g, '-'))).join('/') : item.page_url;
+  if (!pageUrl) { await save(item, 'app_search', { status: 200, text: null, elapsed: 0 }, { note: 'no page url' }, { app }); return app.found ? 'done' : 'unavailable'; }
+  const ghs = [geohash(lat, lng), ...(Array.isArray(item.geohashes) ? item.geohashes.slice(0, 2) : [])].filter((g) => g && !g.startsWith('7zzzz'));
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.5' };
@@ -291,25 +348,23 @@ async function deliveroo(item) {
   for (let i = 0; i < ghs.length; i++) {
     if (i > 0) await sleep(3_000 + Math.random() * 2_000);
     const gh = ghs[i];
-    const url = `${item.page_url}?geohash=${encodeURIComponent(gh)}`;
-    const r = await httpBackoff(url, { headers, redirect: 'follow' });
-    if (r.status === 404) { await save(item, 'menu_page_next_data', r, { method: 'GET', url }, null); return 'unavailable'; }
+    const url = `${pageUrl}?geohash=${encodeURIComponent(gh)}`;
+    const r = await http(url, { headers, redirect: 'follow' });
     const m = /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/.exec(r.text || '');
     let d = null; try { d = m ? JSON.parse(m[1]) : null; } catch (_) { d = null; }
-    const body = d ? { menuPage: d?.props?.initialState?.menuPage ?? null, query: d.query ?? null, page: d.page ?? null, buildId: d.buildId ?? null } : null;
-    const root = body?.menuPage?.menu?.metas?.root;
+    const body = { app, menuPage: d?.props?.initialState?.menuPage ?? null, query: d?.query ?? null, page: d?.page ?? null, buildId: d?.buildId ?? null };
+    const root = body.menuPage?.menu?.metas?.root;
     const isMenu = r.status === 200 && root?.restaurant && Array.isArray(root.categories) && root.categories.length > 0;
-    last = { r, d, body, url, gh };
+    last = { r, body, url, gh };
     if (isMenu) {
       await save(item, 'menu_page_next_data', { ...r, text: null }, { method: 'GET', url, geohash: gh, final_url: r.resp.url, area_try: i + 1 }, body);
       return 'done';
     }
   }
-  // not shown as a menu from any of its areas: keep the last page as evidence
-  const { r, d, body, url, gh } = last;
-  await save(item, 'menu_page_next_data', { ...r, text: d ? null : r.text }, { method: 'GET', url, geohash: gh, final_url: r.resp.url, area_tries: ghs.length }, body);
-  if (r.status !== 200) throw new Error(`deliveroo HTTP ${r.status}`);
-  return 'unavailable';
+  // in the app but its web page showed no menu: still live (the app result is the evidence), menu left empty
+  const { r, body, url, gh } = last;
+  await save(item, 'menu_page_next_data', { ...r, text: null }, { method: 'GET', url, geohash: gh, final_url: r.resp.url, area_tries: ghs.length }, body);
+  return app.found ? 'done' : 'unavailable';
 }
 
 // -- Noon (token minted on this machine, re-located per outlet) --------------
