@@ -98,25 +98,32 @@ def main():
     wanted = {p for (p,) in cur.fetchall()}
     log(f"deliveroo extract rows with a raw page: {len(wanted)}")
 
+    import pyarrow.parquet as pq
+
     table = load_table()
-    reader = table.scan(row_filter=EqualTo("platform", "deliveroo"),
-                        selected_fields=("path", "listing_id", "body")).to_arrow_batch_reader()
+    # Stream each data file in small batches: a file holds up to 1,500 full pages, far too big to load at once.
+    tasks = list(table.scan(row_filter=EqualTo("platform", "deliveroo")).plan_files())
+    log(f"archive files with Deliveroo pages: {len(tasks)}")
     found, empty, rows = 0, 0, []
-    for batch in reader:
-        paths = batch.column("path").to_pylist()
-        lids = batch.column("listing_id").to_pylist()
-        bodies = batch.column("body")
-        for i, p in enumerate(paths):
-            if p not in wanted:
-                continue
-            d = dishes(bodies[i].as_py())
-            found += 1
-            if d is None:
-                empty += 1
-                continue
-            rows.append((p, lids[i], d))
-        del batch, bodies
-        log(f"pages read: {found} matched, {len(rows)} with a menu, {empty} without")
+    for n, task in enumerate(tasks, 1):
+        with table.io.new_input(task.file.file_path).open() as f:
+            pf = pq.ParquetFile(f)
+            for batch in pf.iter_batches(batch_size=20, columns=["platform", "path", "listing_id", "body"]):
+                plats = batch.column("platform").to_pylist()
+                paths = batch.column("path").to_pylist()
+                lids = batch.column("listing_id").to_pylist()
+                bodies = batch.column("body")
+                for i, p in enumerate(paths):
+                    if plats[i] != "deliveroo" or p not in wanted:
+                        continue
+                    d = dishes(bodies[i].as_py())
+                    found += 1
+                    if d is None:
+                        empty += 1
+                        continue
+                    rows.append((p, lids[i], d))
+                del batch, bodies
+        log(f"file {n}/{len(tasks)}: {found} pages matched, {len(rows)} with a menu, {empty} without")
     log(f"done reading: {len(rows)} menus to rewrite, {len(wanted) - found} extract rows whose page was not found")
     if DRY_RUN or not rows:
         sample = rows[:3]
