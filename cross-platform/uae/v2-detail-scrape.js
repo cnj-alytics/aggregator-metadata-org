@@ -8,7 +8,9 @@
 // parks it gzipped in Supabase Storage (v2-staging, recorded in v2.raw_file) and
 // saves only the extracted fields + menu item names to v2.detail_extract.
 // After jobs_per_machine restaurants it exits and Supabase starts a fresh machine.
-// 403/429 = stop this machine.
+// 429/403 = back off on THIS machine (60 s, 120 s, 180 s, 240 s) and retry, as the v1 register-branch job
+// does; only if it is still refused does the machine drop that app, and Supabase slows the whole run.
+// Pace between restaurants comes from Supabase (delay_ms on every claim) with +-30% jitter.
 //
 // Endpoints (full responses, nothing trimmed):
 //   talabat   GET  api.talabat.com/menubff/v4/branches/{bid}/menu
@@ -66,6 +68,25 @@ async function http(url, opts = {}) {
   const text = await resp.text();
   if (resp.status === 429 || resp.status === 403) throw new Blocked(`${new URL(url).host} HTTP ${resp.status}`, resp.status);
   return { resp, status: resp.status, text, elapsed: Date.now() - t0 };
+}
+
+// http() with the v1 back-off: on 429/403 wait 60 s, 120 s, 180 s, 240 s on this machine and try again.
+// Gives up (throws Blocked) only after the last wait, or when the machine's time is nearly used.
+const BACKOFF_MS = [60_000, 120_000, 180_000, 240_000];
+async function httpBackoff(url, opts = {}) {
+  for (let i = 0; ; i++) {
+    try { return await http(url, opts); }
+    catch (e) {
+      if (!(e instanceof Blocked) || i >= BACKOFF_MS.length) throw e;
+      if (Date.now() - START + BACKOFF_MS[i] > WALL_LIMIT_MS - 60_000) throw e;
+      log(`${e.message} - waiting ${BACKOFF_MS[i] / 1000}s before retrying (back-off ${i + 1}/${BACKOFF_MS.length})`);
+      // wait in 50 s steps with a heartbeat, so Supabase does not take this machine for dead (5 min silence)
+      for (let left = BACKOFF_MS[i]; left > 0; left -= 50_000) {
+        await sleep(Math.min(50_000, left));
+        try { await rpc('v2_detail_heartbeat', { p_run: RUN_ID, p_machine: MACHINE }); } catch (_) {}
+      }
+    }
+  }
 }
 
 let BUCKET = 'v2-staging';
@@ -148,9 +169,13 @@ function extract(platform, j) {
     const root = j?.menuPage?.menu?.metas?.root; const R = root?.restaurant; if (!R) return null;
     const pin = findPin(j?.menuPage?.menu?.layoutGroups) || {};
     const loc = R.location || {};
+    // dishes only: an item filed under one of the menu's categories (add-on options sit in the same items list)
+    const cats = new Set((root.categories || []).map((c) => c && c.id));
+    const seen = new Set(), dishes = [];
+    for (const i of root.items || []) { if (i && cats.has(i.categoryId) && !seen.has(i.id)) { seen.add(i.id); dishes.push(i.name); } }
     return { branch_key: str(R.drnId), name: str(R.name), brand_id: str(R.brandDrnId), account_id: str(R.id),
       address: str(loc.address?.address1), area: str(loc.address?.neighborhood), zone: str(loc.zoneId), lat: pin.lat ?? null, lng: pin.lng ?? null,
-      menu: menuNames((root.items || []).map((i) => i.name)), extra: { menu_disabled: R.menuDisabled ?? null, uname: R.uname ?? null } };
+      menu: menuNames(dishes), extra: { menu_disabled: R.menuDisabled ?? null, uname: R.uname ?? null } };
   }
   if (platform === 'noon') {
     const D = j?.data; if (!D) return null;
@@ -255,19 +280,36 @@ async function deliveroo(item) {
     await save(item, 'menu_page_next_data', { status: null, text: null, elapsed: 0 }, { note: 'no page url known' }, null);
     return 'unavailable';
   }
-  const gh = geohash(Number(item.lat), Number(item.lng));
-  const url = `${item.page_url}?geohash=${gh}`;
-  const r = await http(url, { headers: {
+  // View the page as a customer in the restaurant's own delivery areas (nearest 3, from v1), like the v1
+  // register-branch job and dash_menu_live. Deliveroo only shows the menu to an address it delivers to;
+  // otherwise it redirects to the area listing. Falls back to the restaurant pin when no areas are known.
+  const ghs = Array.isArray(item.geohashes) && item.geohashes.length ? item.geohashes.slice(0, 3) : [geohash(Number(item.lat), Number(item.lng))];
+  const headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-    Accept: 'text/html,application/xhtml+xml', 'Accept-Language': 'en-US,en;q=0.5' }, redirect: 'follow' });
-  if (r.status === 404) { await save(item, 'menu_page_next_data', r, { method: 'GET', url }, null); return 'unavailable'; }
-  const m = /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/.exec(r.text || '');
-  let d = null; try { d = m ? JSON.parse(m[1]) : null; } catch (_) { d = null; }
-  const body = d ? { menuPage: d?.props?.initialState?.menuPage ?? null, query: d.query ?? null, page: d.page ?? null, buildId: d.buildId ?? null } : null;
-  await save(item, 'menu_page_next_data', { ...r, text: d ? null : r.text }, { method: 'GET', url, geohash: gh, final_url: r.resp.url }, body);
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.5' };
+  let last = null;
+  for (let i = 0; i < ghs.length; i++) {
+    if (i > 0) await sleep(3_000 + Math.random() * 2_000);
+    const gh = ghs[i];
+    const url = `${item.page_url}?geohash=${encodeURIComponent(gh)}`;
+    const r = await httpBackoff(url, { headers, redirect: 'follow' });
+    if (r.status === 404) { await save(item, 'menu_page_next_data', r, { method: 'GET', url }, null); return 'unavailable'; }
+    const m = /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/.exec(r.text || '');
+    let d = null; try { d = m ? JSON.parse(m[1]) : null; } catch (_) { d = null; }
+    const body = d ? { menuPage: d?.props?.initialState?.menuPage ?? null, query: d.query ?? null, page: d.page ?? null, buildId: d.buildId ?? null } : null;
+    const root = body?.menuPage?.menu?.metas?.root;
+    const isMenu = r.status === 200 && root?.restaurant && Array.isArray(root.categories) && root.categories.length > 0;
+    last = { r, d, body, url, gh };
+    if (isMenu) {
+      await save(item, 'menu_page_next_data', { ...r, text: null }, { method: 'GET', url, geohash: gh, final_url: r.resp.url, area_try: i + 1 }, body);
+      return 'done';
+    }
+  }
+  // not shown as a menu from any of its areas: keep the last page as evidence
+  const { r, d, body, url, gh } = last;
+  await save(item, 'menu_page_next_data', { ...r, text: d ? null : r.text }, { method: 'GET', url, geohash: gh, final_url: r.resp.url, area_tries: ghs.length }, body);
   if (r.status !== 200) throw new Error(`deliveroo HTTP ${r.status}`);
-  if (!body || !body.menuPage) return 'unavailable';
-  return 'done';
+  return 'unavailable';
 }
 
 // -- Noon (token minted on this machine, re-located per outlet) --------------
@@ -363,7 +405,9 @@ for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, async () => { await end
     log(`${item.platform} ${item.branch_key}: ${outcome}${err ? ' | ' + err : ''}`);
     if (outcome === 'blocked') { skip.add(item.platform); log(`skipping ${item.platform} on this machine from now on`); j--; continue; }
     if (rep && rep.action === 'stop') { exitReason = 'stopped by controller'; break; }
-    if (j < jobs - 1) await sleep(delay);
+    // pace set by Supabase (it slows the run after a refusal), with +-30% jitter so machines don't fire in step
+    const pace = Number(item.delay_ms) || delay;
+    if (j < jobs - 1) await sleep(pace * (0.7 + Math.random() * 0.6));
   }
   await endMachine(exitReason);
   log(`=== ${done} restaurants, ${Math.round((Date.now() - START) / 1000)}s, exit "${exitReason}"`);
