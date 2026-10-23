@@ -1,0 +1,40 @@
+name: Cross-platform UAE – v2 Deliveroo dish re-extract
+
+# Re-reads the archived Deliveroo pages (Iceberg v2_raw.detail_pages) and rewrites the dish lists in
+# v2.detail_extract with dishes only (add-on options removed). Reads the archive, never the website.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only read and count, do not write'
+        type: boolean
+        default: false
+
+concurrency:
+  group: v2-reextract-deliveroo
+  cancel-in-progress: false
+
+jobs:
+  reextract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: cross-platform/uae
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --quiet "pyiceberg[pyarrow]==0.12.0" "psycopg[binary]==3.3.6"
+      - name: Re-extract
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_S3_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+          SUPABASE_S3_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
+          SUPABASE_S3_REGION: ap-southeast-2
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: python cross-platform/uae/v2-reextract-deliveroo.py
