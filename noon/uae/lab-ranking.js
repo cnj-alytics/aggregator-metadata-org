@@ -47,6 +47,19 @@ if (PROXY_URL) {
 }
 const proxyOpt = () => (proxyDispatcher ? { dispatcher: proxyDispatcher } : {});
 
+// -- Error diagnostics --------------------------------------------------------
+// undici puts the real failure reason in e.cause (and e.cause.cause, etc.)
+function errorChain(e) {
+  const parts = [];
+  let cur = e;
+  while (cur) {
+    if (cur.message) parts.push(cur.message);
+    if (cur.code) parts.push(`[${cur.code}]`);
+    cur = cur.cause;
+  }
+  return parts.join(' → ') || String(e);
+}
+
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const TEST_ID   = Number(process.env.TEST_ID);
@@ -151,7 +164,11 @@ function fail(step, status, extra = {}) {
 async function noonFetch(step, url, opts) {
   let r; const t0 = Date.now(); requests++;
   try { r = await proxyFetch(url, { ...opts, signal: AbortSignal.timeout(30000), ...proxyOpt() }); }
-  catch (e) { throw Object.assign(fail(step, null), { message: `${step} network: ${e.message}` }); }
+  catch (e) {
+    const chain = errorChain(e);
+    log(`${step} fetch error (${Date.now() - t0}ms): ${chain}`);
+    throw Object.assign(fail(step, null), { message: `${step} network: ${chain}` });
+  }
   try { logRequest(step, url, opts, r, Date.now() - t0); } catch (_) {}
   if (r.status === 403 || r.status === 429) { await captureBlock(step, r); throw fail(step, r.status); }
   return r;
@@ -261,8 +278,51 @@ async function fetchPage(loc, searchToken) {
 // -- Main -------------------------------------------------------------------
 
 (async () => {
+  // -- Proxy connectivity check -----------------------------------------------
   let ip = null;
-  try { ip = (await (await fetch('https://api.ipify.org', { signal: AbortSignal.timeout(4000), ...proxyOpt() })).text()).trim(); } catch (_) {}
+  try {
+    const t0 = Date.now();
+    ip = (await (await proxyFetch('https://api.ipify.org', { signal: AbortSignal.timeout(8000), ...proxyOpt() })).text()).trim();
+    console.log(`[proxy-check] ipify ok ${Date.now() - t0}ms ip=${ip}`);
+  } catch (e) {
+    console.log(`[proxy-check] ipify failed: ${errorChain(e)}`);
+  }
+
+  if (PROXY_URL) {
+    // Test HTTPS tunnel to a simple endpoint — confirms proxy can do HTTPS CONNECT
+    try {
+      const t0 = Date.now();
+      const r = await proxyFetch('https://httpbin.org/status/200', { signal: AbortSignal.timeout(10000), ...proxyOpt() });
+      console.log(`[proxy-check] httpbin ${r.status} ${Date.now() - t0}ms`);
+    } catch (e) {
+      console.log(`[proxy-check] httpbin failed: ${errorChain(e)}`);
+    }
+    // Test HTTPS tunnel specifically to a noon.com host
+    try {
+      const t0 = Date.now();
+      const r = await proxyFetch('https://www.noon.com/robots.txt', {
+        signal: AbortSignal.timeout(10000),
+        headers: { 'User-Agent': UA },
+        ...proxyOpt(),
+      });
+      const body = await r.text().catch(() => '');
+      console.log(`[proxy-check] noon.com/robots.txt ${r.status} ${Date.now() - t0}ms len=${body.length}`);
+    } catch (e) {
+      console.log(`[proxy-check] noon.com failed: ${errorChain(e)}`);
+    }
+    // Test HTTPS tunnel to the actual API host used in mint_whoami
+    try {
+      const t0 = Date.now();
+      const r = await proxyFetch('https://api-app-st.noon.com/', {
+        signal: AbortSignal.timeout(10000),
+        headers: { 'User-Agent': UA },
+        ...proxyOpt(),
+      });
+      console.log(`[proxy-check] api-app-st.noon.com ${r.status} ${Date.now() - t0}ms`);
+    } catch (e) {
+      console.log(`[proxy-check] api-app-st.noon.com failed: ${errorChain(e)}`);
+    }
+  }
 
   const claim = await rpc('noon_lab_claim', { p_test_id: TEST_ID, p_machine_no: MACHINE, p_github_run_id: GH_RUN_ID, p_runner_ip: ip });
   if (!claim || claim.stop) { log(`nothing to do: ${claim && claim.reason}`); return; }
@@ -307,7 +367,7 @@ async function fetchPage(loc, searchToken) {
     Object.assign(result, {
       outcome: e.kind || 'error', fail_step: e.step || 'other', http_status: e.status || null,
       fail_page: e.step === 'search' ? page : null, pages_done: e.step === 'search' ? page - 1 : 0,
-      error: String(e.message).slice(0, 300),
+      error: String(e.message).slice(0, 500),
     });
   }
   Object.assign(result, {
