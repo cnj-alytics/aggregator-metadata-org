@@ -35,6 +35,16 @@
 
 const crypto = require('node:crypto');
 
+// -- Proxy support (Decodo datacenter) ----------------------------------------
+const PROXY_URL = process.env.PROXY_URL || '';
+let proxyDispatcher = null;
+if (PROXY_URL) {
+  const { ProxyAgent } = require('undici');
+  proxyDispatcher = new ProxyAgent(PROXY_URL);
+  console.log(`[proxy] routing Noon requests through proxy`);
+}
+const proxyOpt = () => (proxyDispatcher ? { dispatcher: proxyDispatcher } : {});
+
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const TEST_ID   = Number(process.env.TEST_ID);
@@ -45,8 +55,8 @@ if (!SUPABASE_URL || !SUPABASE_KEY || !TEST_ID || !MACHINE) {
   process.exit(1);
 }
 
-const UA    = 'noon/22895 CFNetwork/3896.100.1.2.1 Darwin/27.0.0';
-const BUILD = '22895';
+const UA    = 'noon/22098 CFNetwork/3896.100.1.2.1 Darwin/27.0.0';
+const BUILD = '22098';
 const WHOAMI_URL       = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami';
 const SET_LOCATION_URL = 'https://api-app.noon.com/_vs/st/mp-identity-api-geo/serviceable-geo-info/set-location-by-lat-lng';
 const WHOAMI_FOOD_URL  = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami?experience=food&select_nearby=1';
@@ -138,7 +148,7 @@ function fail(step, status, extra = {}) {
 }
 async function noonFetch(step, url, opts) {
   let r; const t0 = Date.now(); requests++;
-  try { r = await fetch(url, { ...opts, signal: AbortSignal.timeout(30000) }); }
+  try { r = await fetch(url, { ...opts, signal: AbortSignal.timeout(30000), ...proxyOpt() }); }
   catch (e) { throw Object.assign(fail(step, null), { message: `${step} network: ${e.message}` }); }
   try { logRequest(step, url, opts, r, Date.now() - t0); } catch (_) {}
   if (r.status === 403 || r.status === 429) { await captureBlock(step, r); throw fail(step, r.status); }
@@ -222,17 +232,12 @@ async function fetchPage(loc, searchToken) {
     Cookie: loc.cookie, 'Content-Type': 'application/json',
   };
   for (const [k, v] of Object.entries(loc.zh)) {
-    if (v != null && typeof v !== 'object') headers[k] = String(v);
+    if (v != null && typeof v !== 'object' && !k.toLowerCase().includes('ab-test')) headers[k] = String(v);
   }
   const body = {
     queryEntity: null, q: null, f: {}, contexts: [], withContent: true, excludeOutletCodes: [],
-    limit: PAGE_LIMIT, scopes: null, page: 1, dishTags: [], ratingMin: null,
-    sort: { by: 'popularity', dir: 'desc', slab: null },
-    widgets: null, content: null, withHits: false, filteredByWidget: null,
-    internalFilteredByWidget: 'homepage_navpill_filters_widget',
-    getFallback: true, type: 'outlet', qType: 'search_query',
-    minCount: 0, groupDishes: false, isSsc: false, hideSearchBar: false,
-    hideSearchOptions: false, isOutletAdProcessingEnabled: true, withDishFetchQuery: null,
+    limit: PAGE_LIMIT, page: 1, sort: { by: 'popularity', dir: 'desc' }, type: 'outlet',
+    qType: 'search_query', getFallback: true,
   };
   if (searchToken) body.searchToken = searchToken;
   const resp = await noonFetch('search', SEARCH_URL, { method: 'POST', headers, body: JSON.stringify(body) });
@@ -255,7 +260,7 @@ async function fetchPage(loc, searchToken) {
 
 (async () => {
   let ip = null;
-  try { ip = (await (await fetch('https://api.ipify.org', { signal: AbortSignal.timeout(4000) })).text()).trim(); } catch (_) {}
+  try { ip = (await (await fetch('https://api.ipify.org', { signal: AbortSignal.timeout(4000), ...proxyOpt() })).text()).trim(); } catch (_) {}
 
   const claim = await rpc('noon_lab_claim', { p_test_id: TEST_ID, p_machine_no: MACHINE, p_github_run_id: GH_RUN_ID, p_runner_ip: ip });
   if (!claim || claim.stop) { log(`nothing to do: ${claim && claim.reason}`); return; }
