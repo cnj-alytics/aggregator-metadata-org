@@ -7,6 +7,13 @@
 // Identity (from the claim's identity_mode):
 //   fresh-lower / fresh-upper  new random device + visitor id on every mint (lower / UPPER case)
 //   poolN-*                    a saved "phone" from Supabase (same ids every time it is used)
+// Flow (from the claim's flow; pacing / call-order experiment):
+//   A  5 setup calls back to back, first page at once, 0.5 s between pages (as production)
+//   B  3 setup calls only (no repeated set-location + whoami-food), otherwise as A
+//   C  B + waits: 2-4 s after launch, 1-2 s after location, 4-8 s before the list
+//   D  C + 2-6 s between pages (varied)
+//   E  C with 10-14 s before the list and 4-10 s between pages
+//   Any flow stops paging after 9 minutes (outcome ok, stop_reason time-cap).
 // Akamai log: for every setup call and the first search page (and any page that sets
 // cookies) it records the status, Server header and the cookies set (name, size, lifetime;
 // value only for Akamai cookies ak_bmsc / bm_* / _abck). On 403/429 it records the
@@ -46,6 +53,16 @@ const WHOAMI_FOOD_URL  = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoam
 const SEARCH_URL       = 'https://api-app-fd.noon.com/_svc/mp-food-api-catalog/api/search';
 const PAGE_LIMIT = 60;
 const PAGE_CAP   = 150;
+const TIME_CAP_MS = 9 * 60 * 1000;
+const FLOWS = {
+  A: { locate: true,  launch: null,         loc: null,         list: null,          gap: [500, 500] },
+  B: { locate: false, launch: null,         loc: null,         list: null,          gap: [500, 500] },
+  C: { locate: false, launch: [2000, 4000], loc: [1000, 2000], list: [4000, 8000],  gap: [500, 500] },
+  D: { locate: false, launch: [2000, 4000], loc: [1000, 2000], list: [4000, 8000],  gap: [2000, 6000] },
+  E: { locate: false, launch: [2000, 4000], loc: [1000, 2000], list: [10000, 14000], gap: [4000, 10000] },
+};
+const between = (r) => (r ? r[0] + Math.floor(Math.random() * (r[1] - r[0] + 1)) : 0);
+let requests = 0;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (m) => console.log(`[lab t${TEST_ID} m${MACHINE}] ${m}`);
@@ -120,7 +137,7 @@ function fail(step, status, extra = {}) {
   return Object.assign(new Error(`${step} ${status ? 'HTTP ' + status : ''}`.trim()), { step, status, kind, ...extra });
 }
 async function noonFetch(step, url, opts) {
-  let r; const t0 = Date.now();
+  let r; const t0 = Date.now(); requests++;
   try { r = await fetch(url, { ...opts, signal: AbortSignal.timeout(30000) }); }
   catch (e) { throw Object.assign(fail(step, null), { message: `${step} network: ${e.message}` }); }
   try { logRequest(step, url, opts, r, Date.now() - t0); } catch (_) {}
@@ -138,7 +155,7 @@ function pickIds(mode, identity) {
   return { deviceId: f(crypto.randomUUID()), visitorId: f(crypto.randomUUID()) };
 }
 
-async function mintToken(lat, lng, ids) {
+async function mintToken(lat, lng, ids, flow) {
   const { deviceId, visitorId } = ids;
   const jar = {};
   const base = () => ({
@@ -149,6 +166,7 @@ async function mintToken(lat, lng, ids) {
     headers: { ...base(), 'x-experience': 'ecom', 'x-whoami-request-id': crypto.randomUUID() } });
   if (!r1.ok) throw fail('mint_whoami', r1.status);
   mergeSetCookies(jar, r1);
+  await sleep(between(flow.launch));
 
   const r2 = await noonFetch('mint_set_location', SET_LOCATION_URL, {
     method: 'POST',
@@ -157,15 +175,17 @@ async function mintToken(lat, lng, ids) {
     body: JSON.stringify({ location: { lat, lng }, lang: 'en' }) });
   if (!r2.ok) throw fail('mint_set_location', r2.status);
   mergeSetCookies(jar, r2);
+  await sleep(between(flow.loc));
 
   const r3 = await noonFetch('mint_whoami_food', WHOAMI_FOOD_URL, {
     headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae', 'x-device-lat': String(lat),
       'x-device-lng': String(lng), 'x-whoami-request-id': crypto.randomUUID(), Cookie: cookieStr(jar) } });
   if (!r3.ok) throw fail('mint_whoami_food', r3.status);
-  await r3.json().catch(() => ({}));
+  const who = await r3.json().catch(() => ({}));
   mergeSetCookies(jar, r3);
   if (!jar.nguestv2) throw fail('mint_whoami_food', null, { message: 'mint produced no nguestv2' });
   session = { deviceId, visitorId, jar, mintedAt: Date.now() };
+  return who && who.headers && typeof who.headers === 'object' ? who.headers : {};
 }
 
 function hdrs(lat, lng) {
@@ -237,8 +257,11 @@ async function fetchPage(loc, searchToken) {
 
   const { item_id: itemId, lat, lng, page_delay_ms: delay } = claim;
   const mode = claim.identity_mode || 'fresh-lower';
+  const flowName = FLOWS[claim.flow] ? claim.flow : 'A';
+  const flow = FLOWS[flowName];
   const ids = pickIds(mode, claim.identity);
   log(`ip=${ip} area=${claim.noon_area_id} (${claim.area_name}, usually ${claim.usual_pages}p) delay=${delay}ms attempt=${claim.attempt}`);
+  log(`flow ${flowName} ${JSON.stringify(flow)}`);
   log(`identity ${mode}${claim.identity ? ` #${claim.identity.identity_id} (used ${claim.identity.prior_uses}x, blocked ${claim.identity.prior_blocked}x)` : ''} device=${ids.deviceId}`);
 
   const t0 = Date.now();
@@ -247,8 +270,9 @@ async function fetchPage(loc, searchToken) {
   let setupMs = null, page = 0, stopReason = null;
   const result = {};
   try {
-    await mintToken(lat, lng, ids);
-    const loc = await locate(lat, lng);
+    const mintZh = await mintToken(lat, lng, ids, flow);
+    const loc = flow.locate ? await locate(lat, lng) : { lat, lng, zh: mintZh, cookie: cookieStr(session.jar) };
+    await sleep(between(flow.list));
     setupMs = Date.now() - t0;
     let searchToken = null;
     while (page < PAGE_CAP) {
@@ -262,7 +286,8 @@ async function fetchPage(loc, searchToken) {
       if (fresh.length === 0)     { stopReason = `no-new@${page}`; break; }
       if (!r.token)               { stopReason = `no-token@${page}`; break; }
       searchToken = r.token;
-      await sleep(delay);
+      if (Date.now() - t0 > TIME_CAP_MS) { stopReason = `time-cap@${page}`; break; }
+      await sleep(flow === FLOWS.A ? delay : between(flow.gap));
     }
     if (!stopReason) stopReason = `cap(${PAGE_CAP})`;
     Object.assign(result, { outcome: 'ok', pages_done: page, stop_reason: stopReason });
@@ -276,7 +301,7 @@ async function fetchPage(loc, searchToken) {
   Object.assign(result, {
     cards: seen.size, setup_ms: setupMs, elapsed_ms: Date.now() - t0, page_ms: pageMs,
     token_age_ms: session ? Date.now() - session.mintedAt : null,
-    device_id: ids.deviceId, cookies: reqLog, block_info: blockInfo,
+    device_id: ids.deviceId, cookies: reqLog, block_info: blockInfo, flow: flowName, requests,
   });
   log(`${result.outcome} ${result.fail_step || ''} pages=${result.pages_done} cards=${result.cards} ${result.elapsed_ms}ms`);
   await rpc('noon_lab_report', { p_test_id: TEST_ID, p_machine_no: MACHINE, p_item_id: itemId, p_result: result });
