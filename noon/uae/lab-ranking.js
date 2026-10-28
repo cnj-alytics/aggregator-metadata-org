@@ -4,6 +4,14 @@
 // TEST-ONLY Noon ranking worker (noon_lab). Started by Supabase on the cnj-alytics org
 // machines. Measures what gets blocked; it does NOT save any ranking data.
 //
+// Identity (from the claim's identity_mode):
+//   fresh-lower / fresh-upper  new random device + visitor id on every mint (lower / UPPER case)
+//   poolN-*                    a saved "phone" from Supabase (same ids every time it is used)
+// Akamai log: for every setup call and the first search page (and any page that sets
+// cookies) it records the status, Server header and the cookies set (name, size, lifetime;
+// value only for Akamai cookies ak_bmsc / bm_* / _abck). On 403/429 it records the
+// response headers and the first 400 characters of the body.
+//
 // Rules for one machine:
 //   * ONE area per machine, then exit.
 //   * ONE token per area: whoami -> set-location -> whoami-food, then locate
@@ -68,6 +76,43 @@ function mergeSetCookies(jar, resp) {
   const list = typeof resp.headers.getSetCookie === 'function' ? resp.headers.getSetCookie() : [];
   for (const c of list) { const m = /^([^=]+)=([^;]+)/.exec(c); if (m) jar[m[1]] = m[2]; }
 }
+
+// -- Akamai / cookie log ------------------------------------------------------
+const AKAMAI = /^(ak_bmsc|bm_|_abck)/;
+const reqLog = [];
+let blockInfo = null;
+let searchPagesLogged = 0;
+
+function describeSetCookies(resp) {
+  const list = typeof resp.headers.getSetCookie === 'function' ? resp.headers.getSetCookie() : [];
+  return list.map((c) => {
+    const parts = c.split(';').map((x) => x.trim());
+    const m = /^([^=]+)=(.*)$/.exec(parts[0]) || [];
+    const name = m[1] || '?', value = m[2] || '';
+    const attr = {};
+    for (const p of parts.slice(1)) { const [k, ...v] = p.split('='); attr[k.toLowerCase()] = v.join('=') || true; }
+    const out = { name, len: value.length, max_age: attr['max-age'] || null, expires: attr.expires || null,
+                  domain: attr.domain || null };
+    if (AKAMAI.test(name)) out.value = value.slice(0, 300);
+    return out;
+  });
+}
+
+function logRequest(step, url, opts, resp, ms) {
+  const set = describeSetCookies(resp);
+  if (step === 'search') { searchPagesLogged++; if (searchPagesLogged > 1 && set.length === 0 && resp.ok) return; }
+  const sent = String((opts.headers && opts.headers.Cookie) || '').split(';').map((x) => x.split('=')[0].trim()).filter(Boolean);
+  reqLog.push({ step, host: new URL(url).host, status: resp.status, ms, server: resp.headers.get('server'),
+                sent_cookies: sent, set });
+}
+
+async function captureBlock(step, resp) {
+  const headers = {};
+  resp.headers.forEach((v, k) => { if (k !== 'set-cookie') headers[k] = String(v).slice(0, 200); });
+  let body = '';
+  try { body = (await resp.text()).slice(0, 400); } catch (_) {}
+  blockInfo = { step, status: resp.status, headers, set: describeSetCookies(resp), body };
+}
 const cookieStr = (jar) => Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
 
 function fail(step, status, extra = {}) {
@@ -75,17 +120,26 @@ function fail(step, status, extra = {}) {
   return Object.assign(new Error(`${step} ${status ? 'HTTP ' + status : ''}`.trim()), { step, status, kind, ...extra });
 }
 async function noonFetch(step, url, opts) {
-  let r;
+  let r; const t0 = Date.now();
   try { r = await fetch(url, { ...opts, signal: AbortSignal.timeout(30000) }); }
   catch (e) { throw Object.assign(fail(step, null), { message: `${step} network: ${e.message}` }); }
-  if (r.status === 403 || r.status === 429) throw fail(step, r.status);
+  try { logRequest(step, url, opts, r, Date.now() - t0); } catch (_) {}
+  if (r.status === 403 || r.status === 429) { await captureBlock(step, r); throw fail(step, r.status); }
   return r;
 }
 
 let session = null;
 
-async function mintToken(lat, lng) {
-  const deviceId = crypto.randomUUID(), visitorId = crypto.randomUUID();
+// identity = saved phone from the claim, or null for a fresh random one
+function pickIds(mode, identity) {
+  if (identity && identity.device_id) return { deviceId: identity.device_id, visitorId: identity.visitor_id };
+  const up = String(mode || '').endsWith('-upper');
+  const f = (u) => (up ? u.toUpperCase() : u);
+  return { deviceId: f(crypto.randomUUID()), visitorId: f(crypto.randomUUID()) };
+}
+
+async function mintToken(lat, lng, ids) {
+  const { deviceId, visitorId } = ids;
   const jar = {};
   const base = () => ({
     'User-Agent': UA, 'x-platform': 'ios', 'x-build': BUILD, 'x-mp': 'noon', 'x-content': 'mobile',
@@ -182,7 +236,10 @@ async function fetchPage(loc, searchToken) {
   if (!claim || claim.stop) { log(`nothing to do: ${claim && claim.reason}`); return; }
 
   const { item_id: itemId, lat, lng, page_delay_ms: delay } = claim;
+  const mode = claim.identity_mode || 'fresh-lower';
+  const ids = pickIds(mode, claim.identity);
   log(`ip=${ip} area=${claim.noon_area_id} (${claim.area_name}, usually ${claim.usual_pages}p) delay=${delay}ms attempt=${claim.attempt}`);
+  log(`identity ${mode}${claim.identity ? ` #${claim.identity.identity_id} (used ${claim.identity.prior_uses}x, blocked ${claim.identity.prior_blocked}x)` : ''} device=${ids.deviceId}`);
 
   const t0 = Date.now();
   const pageMs = [];
@@ -190,7 +247,7 @@ async function fetchPage(loc, searchToken) {
   let setupMs = null, page = 0, stopReason = null;
   const result = {};
   try {
-    await mintToken(lat, lng);
+    await mintToken(lat, lng, ids);
     const loc = await locate(lat, lng);
     setupMs = Date.now() - t0;
     let searchToken = null;
@@ -219,6 +276,7 @@ async function fetchPage(loc, searchToken) {
   Object.assign(result, {
     cards: seen.size, setup_ms: setupMs, elapsed_ms: Date.now() - t0, page_ms: pageMs,
     token_age_ms: session ? Date.now() - session.mintedAt : null,
+    device_id: ids.deviceId, cookies: reqLog, block_info: blockInfo,
   });
   log(`${result.outcome} ${result.fail_step || ''} pages=${result.pages_done} cards=${result.cards} ${result.elapsed_ms}ms`);
   await rpc('noon_lab_report', { p_test_id: TEST_ID, p_machine_no: MACHINE, p_item_id: itemId, p_result: result });
