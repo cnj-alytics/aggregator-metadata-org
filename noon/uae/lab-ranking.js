@@ -20,13 +20,11 @@
 // response headers and the first 400 characters of the body.
 //
 // Rules for one machine:
-//   * ONE area per machine, then exit.
-//   * ONE token per area: whoami -> set-location -> whoami-food, then locate
-//     (set-location + whoami-food) — the same 5 setup calls as production.
+//   * Up to MAX_AREAS areas per machine, minting a fresh token for each area.
+//   * Each machine gets its own proxy port (sticky IP) via MACHINE_NO.
 //   * Walk /search page by page with the test's page gap (page_delay_ms) until a page is
 //     empty, adds nothing new, or has no next-page token (cap 150 pages).
-//   * 403 or 429 or any other error -> stop immediately and report. Supabase decides
-//     whether the area is tried again on a fresh machine.
+//   * 403 or 429 or any other error -> report and continue to next area.
 //   * Reports: outcome, failing step/page, pages reached, cards, setup time, time per page.
 //
 // Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, TEST_ID, MACHINE_NO, GITHUB_RUN_ID
@@ -34,41 +32,6 @@
 'use strict';
 
 const crypto = require('node:crypto');
-
-// -- Proxy support (Decodo residential) ---------------------------------------
-const PROXY_URL = process.env.PROXY_URL || '';
-let proxyDispatcher = null;
-let proxyFetch = globalThis.fetch;          // default: Node built-in fetch
-if (PROXY_URL) {
-  const undici = require('undici');
-  // Parse credentials from URL and pass explicitly via token — undici's URI
-  // credential extraction fails with some proxies (407 on CONNECT tunnel).
-  const pu = new URL(PROXY_URL);
-  const proxyOrigin = `${pu.protocol}//${pu.host}`;
-  const agentOpts = { uri: proxyOrigin };
-  if (pu.username) {
-    agentOpts.token = `Basic ${Buffer.from(
-      `${decodeURIComponent(pu.username)}:${decodeURIComponent(pu.password)}`
-    ).toString('base64')}`;
-  }
-  proxyDispatcher = new undici.ProxyAgent(agentOpts);
-  proxyFetch = undici.fetch;                // must use undici's own fetch so the dispatcher matches
-  console.log(`[proxy] routing through ${proxyOrigin} (auth: ${pu.username ? 'yes' : 'none'})`);
-}
-const proxyOpt = () => (proxyDispatcher ? { dispatcher: proxyDispatcher } : {});
-
-// -- Error diagnostics --------------------------------------------------------
-// undici puts the real failure reason in e.cause (and e.cause.cause, etc.)
-function errorChain(e) {
-  const parts = [];
-  let cur = e;
-  while (cur) {
-    if (cur.message) parts.push(cur.message);
-    if (cur.code) parts.push(`[${cur.code}]`);
-    cur = cur.cause;
-  }
-  return parts.join(' → ') || String(e);
-}
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -80,6 +43,43 @@ if (!SUPABASE_URL || !SUPABASE_KEY || !TEST_ID || !MACHINE) {
   process.exit(1);
 }
 
+// -- Proxy support (Decodo residential) ---------------------------------------
+// Each machine gets its own port for a unique sticky IP.
+// Decodo UAE ports: 20001-20010. PROXY_URL base port is the starting port.
+const PROXY_URL = process.env.PROXY_URL || '';
+let proxyDispatcher = null;
+let proxyFetch = globalThis.fetch;          // default: Node built-in fetch
+if (PROXY_URL) {
+  const undici = require('undici');
+  const pu = new URL(PROXY_URL);
+  // Assign unique port per machine: machine 1 → base port, machine 2 → base+1, etc.
+  const basePort = parseInt(pu.port, 10) || 20001;
+  const machinePort = basePort + MACHINE - 1;
+  const proxyOrigin = `${pu.protocol}//${pu.hostname}:${machinePort}`;
+  const agentOpts = { uri: proxyOrigin };
+  if (pu.username) {
+    agentOpts.token = `Basic ${Buffer.from(
+      `${decodeURIComponent(pu.username)}:${decodeURIComponent(pu.password)}`
+    ).toString('base64')}`;
+  }
+  proxyDispatcher = new undici.ProxyAgent(agentOpts);
+  proxyFetch = undici.fetch;                // must use undici's own fetch so the dispatcher matches
+  console.log(`[proxy] machine ${MACHINE} routing through ${proxyOrigin} (auth: ${pu.username ? 'yes' : 'none'})`);
+}
+const proxyOpt = () => (proxyDispatcher ? { dispatcher: proxyDispatcher } : {});
+
+// -- Error diagnostics --------------------------------------------------------
+function errorChain(e) {
+  const parts = [];
+  let cur = e;
+  while (cur) {
+    if (cur.message) parts.push(cur.message);
+    if (cur.code) parts.push(`[${cur.code}]`);
+    cur = cur.cause;
+  }
+  return parts.join(' → ') || String(e);
+}
+
 const UA    = 'noon/22098 CFNetwork/3896.100.1.2.1 Darwin/27.0.0';
 const BUILD = '22098';
 const WHOAMI_URL       = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami';
@@ -89,6 +89,7 @@ const SEARCH_URL       = 'https://api-app-fd.noon.com/_svc/mp-food-api-catalog/a
 const PAGE_LIMIT = 60;
 const PAGE_CAP   = 150;
 const TIME_CAP_MS = 9 * 60 * 1000;
+const MAX_AREAS  = 10;
 const FLOWS = {
   A: { locate: true,  launch: null,         loc: null,         list: null,          gap: [500, 500] },
   B: { locate: false, launch: null,         loc: null,         list: null,          gap: [500, 500] },
@@ -97,7 +98,21 @@ const FLOWS = {
   E: { locate: false, launch: [2000, 4000], loc: [1000, 2000], list: [10000, 14000], gap: [4000, 10000] },
 };
 const between = (r) => (r ? r[0] + Math.floor(Math.random() * (r[1] - r[0] + 1)) : 0);
+
+// -- Per-area mutable state (reset between areas) -----------------------------
 let requests = 0;
+let session = null;
+let blockInfo = null;
+let searchPagesLogged = 0;
+const reqLog = [];
+
+function resetAreaState() {
+  requests = 0;
+  session = null;
+  blockInfo = null;
+  searchPagesLogged = 0;
+  reqLog.length = 0;
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (m) => console.log(`[lab t${TEST_ID} m${MACHINE}] ${m}`);
@@ -131,9 +146,6 @@ function mergeSetCookies(jar, resp) {
 
 // -- Akamai / cookie log ------------------------------------------------------
 const AKAMAI = /^(ak_bmsc|bm_|_abck)/;
-const reqLog = [];
-let blockInfo = null;
-let searchPagesLogged = 0;
 
 function describeSetCookies(resp) {
   const list = typeof resp.headers.getSetCookie === 'function' ? resp.headers.getSetCookie() : [];
@@ -183,8 +195,6 @@ async function noonFetch(step, url, opts) {
   if (r.status === 403 || r.status === 429) { await captureBlock(step, r); throw fail(step, r.status); }
   return r;
 }
-
-let session = null;
 
 // identity = saved phone from the claim, or null for a fresh random one
 function pickIds(mode, identity) {
@@ -288,7 +298,7 @@ async function fetchPage(loc, searchToken) {
 // -- Main -------------------------------------------------------------------
 
 (async () => {
-  // -- Proxy connectivity check -----------------------------------------------
+  // -- Proxy connectivity check (once per machine) ----------------------------
   let ip = null;
   try {
     const t0 = Date.now();
@@ -298,95 +308,69 @@ async function fetchPage(loc, searchToken) {
     console.log(`[proxy-check] ipify failed: ${errorChain(e)}`);
   }
 
-  if (PROXY_URL) {
-    // Test HTTPS tunnel to a simple endpoint — confirms proxy can do HTTPS CONNECT
+  // -- Area loop: up to MAX_AREAS claims per machine --------------------------
+  let areasCompleted = 0;
+  for (let areaNum = 1; areaNum <= MAX_AREAS; areaNum++) {
+    resetAreaState();
+
+    const claim = await rpc('noon_lab_claim', { p_test_id: TEST_ID, p_machine_no: MACHINE, p_github_run_id: GH_RUN_ID, p_runner_ip: ip });
+    if (!claim || claim.stop) { log(`area ${areaNum}: nothing to do — ${claim && claim.reason}`); break; }
+
+    const { item_id: itemId, lat, lng, page_delay_ms: delay } = claim;
+    const mode = claim.identity_mode || 'fresh-lower';
+    const flowName = FLOWS[claim.flow] ? claim.flow : 'A';
+    const flow = FLOWS[flowName];
+    const ids = pickIds(mode, claim.identity);
+    log(`area ${areaNum}/${MAX_AREAS}: id=${claim.noon_area_id} (${claim.area_name}, usually ${claim.usual_pages}p) delay=${delay}ms attempt=${claim.attempt}`);
+    log(`flow ${flowName} identity ${mode} device=${ids.deviceId}`);
+
+    const t0 = Date.now();
+    const pageMs = [];
+    const seen = new Set();
+    let setupMs = null, page = 0, stopReason = null;
+    const result = {};
     try {
-      const t0 = Date.now();
-      const r = await proxyFetch('https://httpbin.org/status/200', { signal: AbortSignal.timeout(10000), ...proxyOpt() });
-      console.log(`[proxy-check] httpbin ${r.status} ${Date.now() - t0}ms`);
+      const mintZh = await mintToken(lat, lng, ids, flow);
+      const loc = flow.locate ? await locate(lat, lng) : { lat, lng, zh: mintZh, cookie: cookieStr(session.jar) };
+      await sleep(between(flow.list));
+      setupMs = Date.now() - t0;
+      let searchToken = null;
+      while (page < PAGE_CAP) {
+        page++;
+        const p0 = Date.now();
+        const r = await fetchPage(loc, searchToken);
+        pageMs.push(Date.now() - p0);
+        const fresh = r.outlets.filter((o) => !seen.has(o.outletCode));
+        for (const o of fresh) seen.add(o.outletCode);
+        if (r.outlets.length === 0) { stopReason = `empty@${page}`; break; }
+        if (fresh.length === 0)     { stopReason = `no-new@${page}`; break; }
+        if (!r.token)               { stopReason = `no-token@${page}`; break; }
+        searchToken = r.token;
+        if (Date.now() - t0 > TIME_CAP_MS) { stopReason = `time-cap@${page}`; break; }
+        await sleep(flow === FLOWS.A ? delay : between(flow.gap));
+      }
+      if (!stopReason) stopReason = `cap(${PAGE_CAP})`;
+      Object.assign(result, { outcome: 'ok', pages_done: page, stop_reason: stopReason });
     } catch (e) {
-      console.log(`[proxy-check] httpbin failed: ${errorChain(e)}`);
-    }
-    // Test HTTPS tunnel specifically to a noon.com host
-    try {
-      const t0 = Date.now();
-      const r = await proxyFetch('https://www.noon.com/robots.txt', {
-        signal: AbortSignal.timeout(10000),
-        headers: { 'User-Agent': UA },
-        ...proxyOpt(),
+      Object.assign(result, {
+        outcome: e.kind || 'error', fail_step: e.step || 'other', http_status: e.status || null,
+        fail_page: e.step === 'search' ? page : null, pages_done: e.step === 'search' ? page - 1 : 0,
+        error: String(e.message).slice(0, 500),
       });
-      const body = await r.text().catch(() => '');
-      console.log(`[proxy-check] noon.com/robots.txt ${r.status} ${Date.now() - t0}ms len=${body.length}`);
-    } catch (e) {
-      console.log(`[proxy-check] noon.com failed: ${errorChain(e)}`);
     }
-    // Test HTTPS tunnel to the actual API host used in mint_whoami
-    try {
-      const t0 = Date.now();
-      const r = await proxyFetch('https://api-app-st.noon.com/', {
-        signal: AbortSignal.timeout(10000),
-        headers: { 'User-Agent': UA },
-        ...proxyOpt(),
-      });
-      console.log(`[proxy-check] api-app-st.noon.com ${r.status} ${Date.now() - t0}ms`);
-    } catch (e) {
-      console.log(`[proxy-check] api-app-st.noon.com failed: ${errorChain(e)}`);
-    }
-  }
-
-  const claim = await rpc('noon_lab_claim', { p_test_id: TEST_ID, p_machine_no: MACHINE, p_github_run_id: GH_RUN_ID, p_runner_ip: ip });
-  if (!claim || claim.stop) { log(`nothing to do: ${claim && claim.reason}`); return; }
-
-  const { item_id: itemId, lat, lng, page_delay_ms: delay } = claim;
-  const mode = claim.identity_mode || 'fresh-lower';
-  const flowName = FLOWS[claim.flow] ? claim.flow : 'A';
-  const flow = FLOWS[flowName];
-  const ids = pickIds(mode, claim.identity);
-  log(`ip=${ip} area=${claim.noon_area_id} (${claim.area_name}, usually ${claim.usual_pages}p) delay=${delay}ms attempt=${claim.attempt}`);
-  log(`flow ${flowName} ${JSON.stringify(flow)}`);
-  log(`identity ${mode}${claim.identity ? ` #${claim.identity.identity_id} (used ${claim.identity.prior_uses}x, blocked ${claim.identity.prior_blocked}x)` : ''} device=${ids.deviceId}`);
-
-  const t0 = Date.now();
-  const pageMs = [];
-  const seen = new Set();
-  let setupMs = null, page = 0, stopReason = null;
-  const result = {};
-  try {
-    const mintZh = await mintToken(lat, lng, ids, flow);
-    const loc = flow.locate ? await locate(lat, lng) : { lat, lng, zh: mintZh, cookie: cookieStr(session.jar) };
-    await sleep(between(flow.list));
-    setupMs = Date.now() - t0;
-    let searchToken = null;
-    while (page < PAGE_CAP) {
-      page++;
-      const p0 = Date.now();
-      const r = await fetchPage(loc, searchToken);
-      pageMs.push(Date.now() - p0);
-      const fresh = r.outlets.filter((o) => !seen.has(o.outletCode));
-      for (const o of fresh) seen.add(o.outletCode);
-      if (r.outlets.length === 0) { stopReason = `empty@${page}`; break; }
-      if (fresh.length === 0)     { stopReason = `no-new@${page}`; break; }
-      if (!r.token)               { stopReason = `no-token@${page}`; break; }
-      searchToken = r.token;
-      if (Date.now() - t0 > TIME_CAP_MS) { stopReason = `time-cap@${page}`; break; }
-      await sleep(flow === FLOWS.A ? delay : between(flow.gap));
-    }
-    if (!stopReason) stopReason = `cap(${PAGE_CAP})`;
-    Object.assign(result, { outcome: 'ok', pages_done: page, stop_reason: stopReason });
-  } catch (e) {
     Object.assign(result, {
-      outcome: e.kind || 'error', fail_step: e.step || 'other', http_status: e.status || null,
-      fail_page: e.step === 'search' ? page : null, pages_done: e.step === 'search' ? page - 1 : 0,
-      error: String(e.message).slice(0, 500),
+      cards: seen.size, setup_ms: setupMs, elapsed_ms: Date.now() - t0, page_ms: pageMs,
+      token_age_ms: session ? Date.now() - session.mintedAt : null,
+      device_id: ids.deviceId, cookies: reqLog, block_info: blockInfo, flow: flowName, requests,
     });
+    log(`area ${areaNum} → ${result.outcome} ${result.fail_step || ''} pages=${result.pages_done} cards=${result.cards} ${result.elapsed_ms}ms`);
+    await rpc('noon_lab_report', { p_test_id: TEST_ID, p_machine_no: MACHINE, p_item_id: itemId, p_result: result });
+    areasCompleted++;
+
+    // Brief pause between areas to avoid hammering
+    if (areaNum < MAX_AREAS) await sleep(2000);
   }
-  Object.assign(result, {
-    cards: seen.size, setup_ms: setupMs, elapsed_ms: Date.now() - t0, page_ms: pageMs,
-    token_age_ms: session ? Date.now() - session.mintedAt : null,
-    device_id: ids.deviceId, cookies: reqLog, block_info: blockInfo, flow: flowName, requests,
-  });
-  log(`${result.outcome} ${result.fail_step || ''} pages=${result.pages_done} cards=${result.cards} ${result.elapsed_ms}ms`);
-  await rpc('noon_lab_report', { p_test_id: TEST_ID, p_machine_no: MACHINE, p_item_id: itemId, p_result: result });
+  log(`done — ${areasCompleted} area(s) completed`);
 })().catch(async (e) => {
   console.error(`[lab t${TEST_ID} m${MACHINE}] fatal: ${e.message}`);
   try { await rpc('noon_lab_report', { p_test_id: TEST_ID, p_machine_no: MACHINE, p_item_id: null, p_result: { outcome: 'error', error: e.message } }); } catch (_) {}
