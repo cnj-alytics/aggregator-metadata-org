@@ -41,9 +41,19 @@ let proxyDispatcher = null;
 let proxyFetch = globalThis.fetch;          // default: Node built-in fetch
 if (PROXY_URL) {
   const undici = require('undici');
-  proxyDispatcher = new undici.ProxyAgent(PROXY_URL);
+  // Parse credentials from URL and pass explicitly via token — undici's URI
+  // credential extraction fails with some proxies (407 on CONNECT tunnel).
+  const pu = new URL(PROXY_URL);
+  const proxyOrigin = `${pu.protocol}//${pu.host}`;
+  const agentOpts = { uri: proxyOrigin };
+  if (pu.username) {
+    agentOpts.token = `Basic ${Buffer.from(
+      `${decodeURIComponent(pu.username)}:${decodeURIComponent(pu.password)}`
+    ).toString('base64')}`;
+  }
+  proxyDispatcher = new undici.ProxyAgent(agentOpts);
   proxyFetch = undici.fetch;                // must use undici's own fetch so the dispatcher matches
-  console.log(`[proxy] routing Noon requests through proxy`);
+  console.log(`[proxy] routing through ${proxyOrigin} (auth: ${pu.username ? 'yes' : 'none'})`);
 }
 const proxyOpt = () => (proxyDispatcher ? { dispatcher: proxyDispatcher } : {});
 
