@@ -45,8 +45,8 @@ if (!SUPABASE_URL || !SUPABASE_KEY || !TEST_ID || !MACHINE) {
   process.exit(1);
 }
 
-const UA    = 'noon/22098 CFNetwork/3896.100.1.2.1 Darwin/27.0.0';
-const BUILD = '22098';
+const UA    = 'noon/22895 CFNetwork/3896.100.1.2.1 Darwin/27.0.0';
+const BUILD = '22895';
 const WHOAMI_URL       = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami';
 const SET_LOCATION_URL = 'https://api-app.noon.com/_vs/st/mp-identity-api-geo/serviceable-geo-info/set-location-by-lat-lng';
 const WHOAMI_FOOD_URL  = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami?experience=food&select_nearby=1';
@@ -222,12 +222,17 @@ async function fetchPage(loc, searchToken) {
     Cookie: loc.cookie, 'Content-Type': 'application/json',
   };
   for (const [k, v] of Object.entries(loc.zh)) {
-    if (v != null && typeof v !== 'object' && !k.toLowerCase().includes('ab-test')) headers[k] = String(v);
+    if (v != null && typeof v !== 'object') headers[k] = String(v);
   }
   const body = {
     queryEntity: null, q: null, f: {}, contexts: [], withContent: true, excludeOutletCodes: [],
-    limit: PAGE_LIMIT, page: 1, sort: { by: 'popularity', dir: 'desc' }, type: 'outlet',
-    qType: 'search_query', getFallback: true,
+    limit: PAGE_LIMIT, scopes: null, page: 1, dishTags: [], ratingMin: null,
+    sort: { by: 'popularity', dir: 'desc', slab: null },
+    widgets: null, content: null, withHits: false, filteredByWidget: null,
+    internalFilteredByWidget: 'homepage_navpill_filters_widget',
+    getFallback: true, type: 'outlet', qType: 'search_query',
+    minCount: 0, groupDishes: false, isSsc: false, hideSearchBar: false,
+    hideSearchOptions: false, isOutletAdProcessingEnabled: true, withDishFetchQuery: null,
   };
   if (searchToken) body.searchToken = searchToken;
   const resp = await noonFetch('search', SEARCH_URL, { method: 'POST', headers, body: JSON.stringify(body) });
