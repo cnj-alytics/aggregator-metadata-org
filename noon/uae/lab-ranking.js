@@ -35,12 +35,14 @@
 
 const crypto = require('node:crypto');
 
-// -- Proxy support (Decodo datacenter) ----------------------------------------
+// -- Proxy support (Decodo residential) ---------------------------------------
 const PROXY_URL = process.env.PROXY_URL || '';
 let proxyDispatcher = null;
+let proxyFetch = globalThis.fetch;          // default: Node built-in fetch
 if (PROXY_URL) {
-  const { ProxyAgent } = require('undici');
-  proxyDispatcher = new ProxyAgent(PROXY_URL);
+  const undici = require('undici');
+  proxyDispatcher = new undici.ProxyAgent(PROXY_URL);
+  proxyFetch = undici.fetch;                // must use undici's own fetch so the dispatcher matches
   console.log(`[proxy] routing Noon requests through proxy`);
 }
 const proxyOpt = () => (proxyDispatcher ? { dispatcher: proxyDispatcher } : {});
@@ -148,7 +150,7 @@ function fail(step, status, extra = {}) {
 }
 async function noonFetch(step, url, opts) {
   let r; const t0 = Date.now(); requests++;
-  try { r = await fetch(url, { ...opts, signal: AbortSignal.timeout(30000), ...proxyOpt() }); }
+  try { r = await proxyFetch(url, { ...opts, signal: AbortSignal.timeout(30000), ...proxyOpt() }); }
   catch (e) { throw Object.assign(fail(step, null), { message: `${step} network: ${e.message}` }); }
   try { logRequest(step, url, opts, r, Date.now() - t0); } catch (_) {}
   if (r.status === 403 || r.status === 429) { await captureBlock(step, r); throw fail(step, r.status); }
