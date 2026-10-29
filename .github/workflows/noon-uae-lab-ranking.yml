@@ -16,6 +16,11 @@ on:
         description: 'noon_lab.machine.machine_no'
         required: true
         type: string
+      http1_only:
+        description: 'Force HTTP/1.1 (set to 1)'
+        required: false
+        type: string
+        default: '0'
 
 concurrency:
   group: noon-lab-${{ inputs.test_id }}-m${{ inputs.machine_no }}
@@ -41,6 +46,7 @@ jobs:
           TEST_ID: ${{ inputs.test_id }}
           MACHINE_NO: ${{ inputs.machine_no }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          HTTP1_ONLY: ${{ inputs.http1_only }}
         run: |
           npm install undici
           node noon/uae/lab-ranking.js
