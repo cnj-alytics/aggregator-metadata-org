@@ -47,10 +47,11 @@ if (!SUPABASE_URL || !SUPABASE_KEY || !TEST_ID || !MACHINE) {
 // Each machine gets its own port for a unique sticky IP.
 // Decodo UAE ports: 20001-20010. PROXY_URL base port is the starting port.
 const PROXY_URL = process.env.PROXY_URL || '';
+const HTTP1_ONLY = process.env.HTTP1_ONLY === '1';  // force HTTP/1.1 (no HTTP/2)
 let proxyDispatcher = null;
 let proxyFetch = globalThis.fetch;          // default: Node built-in fetch
+const undici = require('undici');
 if (PROXY_URL) {
-  const undici = require('undici');
   const pu = new URL(PROXY_URL);
   // Assign unique port per machine: machine 1 → base port, machine 2 → base+1, etc.
   const basePort = parseInt(pu.port, 10) || 20001;
@@ -65,6 +66,11 @@ if (PROXY_URL) {
   proxyDispatcher = new undici.ProxyAgent(agentOpts);
   proxyFetch = undici.fetch;                // must use undici's own fetch so the dispatcher matches
   console.log(`[proxy] machine ${MACHINE} routing through ${proxyOrigin} (auth: ${pu.username ? 'yes' : 'none'})`);
+} else if (HTTP1_ONLY) {
+  // Force HTTP/1.1 by using undici Agent with allowH2 disabled
+  proxyDispatcher = new undici.Agent({ allowH2: false });
+  proxyFetch = undici.fetch;
+  console.log(`[http] forcing HTTP/1.1 (no H2)`);
 }
 const proxyOpt = () => (proxyDispatcher ? { dispatcher: proxyDispatcher } : {});
 
