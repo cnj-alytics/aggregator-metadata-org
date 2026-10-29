@@ -181,9 +181,9 @@ const between = (r) => (r ? r[0] + Math.floor(Math.random() * (r[1] - r[0] + 1))
 // prime pages ≥ 7: 3000ms (stopped to read a restaurant).
 function _isPrime(n) { if (n < 2) return false; for (let i = 2; i * i <= n; i++) if (n % i === 0) return false; return true; }
 function pageGap(page) {
-  if (page >= 7 && _isPrime(page)) return 3000;
-  if (page % 2 === 0) return 1250;
-  return 500;
+  // Burst-scroll: 3 pages at 750ms, then 2s pause to "read results"
+  if (page % 3 === 0) return 2000;   // pause after every 3rd page
+  return 750;                          // quick scroll within burst
 }
 
 // -- Per-area mutable state (reset between areas) -----------------------------
