@@ -42,7 +42,7 @@ jobs:
           sparse-checkout: noon/uae
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '20'
       - name: Run lab worker
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
