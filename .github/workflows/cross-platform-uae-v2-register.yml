@@ -1,0 +1,44 @@
+name: Cross-platform UAE – v2 Register (started by Supabase)
+run-name: v2 register ${{ inputs.app }} runner ${{ inputs.runner_id }}
+
+# v2 registration queue (Supabase schema reg). One run = one runner for one app.
+# Supabase (Edge Function reg-dispatch) starts it, hands it restaurants one at a time (reg_claim),
+# and the runner reports each scraped page back (reg_report). Linking into v2 happens in Supabase afterwards.
+# Pause everything: update reg.setting set value = 'true' where key = 'paused';
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_id:
+        description: 'reg.runner.runner_id'
+        required: true
+        type: string
+      app:
+        description: 'talabat | careem | deliveroo | noon'
+        required: true
+        type: string
+
+concurrency:
+  group: v2-register-runner-${{ inputs.runner_id }}
+  cancel-in-progress: false
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    name: ${{ inputs.app }} runner ${{ inputs.runner_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: cross-platform/uae
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run v2 register
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUNNER_ID: ${{ inputs.runner_id }}
+          APP: ${{ inputs.app }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: node cross-platform/uae/v2-register.js
