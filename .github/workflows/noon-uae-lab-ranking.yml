@@ -26,6 +26,11 @@ on:
         required: false
         type: string
         default: '0'
+      adaptive_http:
+        description: 'Smart cascade: try h2 → h1.1 → h1.0 per area (set to 1)'
+        required: false
+        type: string
+        default: '0'
       max_areas:
         description: 'Max areas per machine (default 10)'
         required: false
@@ -58,6 +63,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           HTTP1_ONLY: ${{ inputs.http1_only }}
           HTTP10_MODE: ${{ inputs.http10_mode }}
+          ADAPTIVE_HTTP: ${{ inputs.adaptive_http }}
           MAX_AREAS: ${{ inputs.max_areas }}
         run: |
           npm install undici
