@@ -156,8 +156,8 @@ function errorChain(e) {
   return parts.join(' → ') || String(e);
 }
 
-const UA    = 'noon/22098 CFNetwork/3896.100.1.2.1 Darwin/27.0.0';
-const BUILD = '22098';
+const UA    = 'noon/22895 CFNetwork/3896.100.1.2.1 Darwin/27.0.0';
+const BUILD = '22895';
 const WHOAMI_URL       = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami';
 const SET_LOCATION_URL = 'https://api-app.noon.com/_vs/st/mp-identity-api-geo/serviceable-geo-info/set-location-by-lat-lng';
 const WHOAMI_FOOD_URL  = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami?experience=food&select_nearby=1';
@@ -315,9 +315,16 @@ function pickIds(mode, identity) {
 async function mintToken(lat, lng, ids, flow) {
   const { deviceId, visitorId } = ids;
   const jar = {};
+  const sentryId = crypto.randomUUID().replace(/-/g, '');
   const base = () => ({
     'User-Agent': UA, 'x-platform': 'ios', 'x-build': BUILD, 'x-mp': 'noon', 'x-content': 'mobile',
-    Accept: 'application/json', 'x-device-id': deviceId, 'x-visitor-id': visitorId,
+    Accept: 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Cache-Control': 'no-cache',
+    'x-device-id': deviceId, 'x-visitor-id': visitorId,
+    'sentry-trace': `${sentryId}-${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
+    baggage: `sentry-environment=production,sentry-public_key=d61e4de762b3c36e7c14f2d7cf6030c1,sentry-release=com.noon.buyerapp%405.261024%2B${BUILD},sentry-trace_id=${sentryId}`,
   });
   const r1 = await noonFetch('mint_whoami', WHOAMI_URL, {
     headers: { ...base(), 'x-experience': 'ecom', 'x-whoami-request-id': crypto.randomUUID() } });
@@ -346,10 +353,17 @@ async function mintToken(lat, lng, ids, flow) {
 }
 
 function hdrs(lat, lng) {
+  const sid = crypto.randomUUID().replace(/-/g, '');
   return {
     'User-Agent': UA, 'x-platform': 'ios', 'x-build': BUILD, 'x-mp': 'noon', 'x-content': 'mobile',
     'x-locale': 'en-ae', 'x-device-id': session.deviceId, 'x-visitor-id': session.visitorId,
-    'x-device-lat': String(lat), 'x-device-lng': String(lng), Accept: 'application/json',
+    'x-device-lat': String(lat), 'x-device-lng': String(lng),
+    Accept: 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Cache-Control': 'no-cache',
+    'sentry-trace': `${sid}-${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}-0`,
+    baggage: `sentry-environment=production,sentry-public_key=d61e4de762b3c36e7c14f2d7cf6030c1,sentry-release=com.noon.buyerapp%405.261024%2B${BUILD},sentry-trace_id=${sid}`,
   };
 }
 
@@ -375,11 +389,12 @@ async function fetchPage(loc, searchToken) {
   const headers = {
     ...hdrs(lat, lng), 'x-mp-country': 'ae', 'x-experience': 'food',
     'x-lat': String(Math.round(lat * 1e7)), 'x-lng': String(Math.round(lng * 1e7)),
-    'x-border-enabled': 'true', 'x-rocket-enabled': 'true', 'x-whoami-request-id': crypto.randomUUID(),
+    'x-border-enabled': 'true', 'x-rocket-enabled': 'true',
     Cookie: loc.cookie, 'Content-Type': 'application/json',
   };
+  // Pass ALL whoami headers including zone codes and ab-test (real app sends them all)
   for (const [k, v] of Object.entries(loc.zh)) {
-    if (v != null && typeof v !== 'object' && !k.toLowerCase().includes('ab-test')) headers[k] = String(v);
+    if (v != null && typeof v !== 'object') headers[k] = String(v);
   }
   const body = {
     queryEntity: null, q: null, f: {}, contexts: [], withContent: true, excludeOutletCodes: [],
