@@ -21,6 +21,11 @@ on:
         required: false
         type: string
         default: '0'
+      http10_mode:
+        description: 'Force HTTP/1.0 style — fresh TCP per request (set to 1)'
+        required: false
+        type: string
+        default: '0'
       max_areas:
         description: 'Max areas per machine (default 10)'
         required: false
@@ -52,6 +57,7 @@ jobs:
           MACHINE_NO: ${{ inputs.machine_no }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           HTTP1_ONLY: ${{ inputs.http1_only }}
+          HTTP10_MODE: ${{ inputs.http10_mode }}
           MAX_AREAS: ${{ inputs.max_areas }}
         run: |
           npm install undici
