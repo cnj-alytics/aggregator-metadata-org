@@ -58,6 +58,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+      - name: Install curl with HTTP/3
+        if: inputs.http3_only == '1'
+        run: |
+          # Ubuntu's default curl lacks HTTP/3 (QUIC). Install cloudflare's static build.
+          curl -sL https://github.com/stunnel/static-curl/releases/download/8.12.1/curl-linux-x86_64-8.12.1.tar.xz | tar xJ
+          sudo mv curl /usr/local/bin/curl
+          curl --version | head -1
+          curl --version | grep -i 'http3\|HTTP3' && echo "HTTP/3: YES" || echo "HTTP/3: checking..."
       - name: Run lab worker
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
