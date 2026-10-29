@@ -53,6 +53,7 @@ jobs:
           TEST_ID: ${{ inputs.test_id }}
           MACHINE_NO: ${{ inputs.machine_no }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          HTTP1_ONLY: '1'
         run: |
           npm install undici
           node noon/uae/lab-ranking.js
