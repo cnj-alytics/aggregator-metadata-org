@@ -32,6 +32,23 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Network diagnostics
+        run: |
+          echo "=== Runner IP ==="
+          curl -s https://api.ipify.org
+          echo ""
+          echo "=== DNS resolve api-app-st.noon.com ==="
+          dig +short api-app-st.noon.com || nslookup api-app-st.noon.com || echo "dig/nslookup not available"
+          echo "=== DNS resolve www.noon.com ==="
+          dig +short www.noon.com || nslookup www.noon.com || echo "dig/nslookup not available"
+          echo "=== curl -v noon whoami (10s timeout) ==="
+          curl -v --max-time 10 -H "User-Agent: noon/22098" https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami 2>&1 || true
+          echo ""
+          echo "=== curl -v www.noon.com (10s timeout) ==="
+          curl -v --max-time 10 https://www.noon.com/ 2>&1 | head -30 || true
+          echo ""
+          echo "=== curl -v noon food search endpoint (10s timeout) ==="
+          curl -v --max-time 10 https://api-app-fd.noon.com/_svc/mp-food-api-catalog/api/search 2>&1 || true
       - name: Run lab worker
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
