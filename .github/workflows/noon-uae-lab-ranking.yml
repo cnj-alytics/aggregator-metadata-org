@@ -36,6 +36,11 @@ on:
         required: false
         type: string
         default: '0'
+      varied_delay:
+        description: 'Human-like variable page timing (set to 1)'
+        required: false
+        type: string
+        default: '0'
       max_areas:
         description: 'Max areas per machine (default 10)'
         required: false
@@ -79,6 +84,7 @@ jobs:
           HTTP10_MODE: ${{ inputs.http10_mode }}
           ADAPTIVE_HTTP: ${{ inputs.adaptive_http }}
           HTTP3_ONLY: ${{ inputs.http3_only }}
+          VARIED_DELAY: ${{ inputs.varied_delay }}
           MAX_AREAS: ${{ inputs.max_areas }}
         run: |
           npm install undici
