@@ -61,11 +61,12 @@ jobs:
       - name: Install curl with HTTP/3
         if: inputs.http3_only == '1'
         run: |
-          # Ubuntu's default curl lacks HTTP/3 (QUIC). Install cloudflare's static build.
-          curl -sL https://github.com/stunnel/static-curl/releases/download/8.12.1/curl-linux-x86_64-8.12.1.tar.xz | tar xJ
-          sudo mv curl /usr/local/bin/curl
+          # Ubuntu's default curl lacks HTTP/3 (QUIC). Install stunnel's static build with ngtcp2+nghttp3.
+          curl -sL https://github.com/stunnel/static-curl/releases/download/8.23.0/curl-linux-x86_64-glibc-8.23.0.tar.xz -o /tmp/curl-h3.tar.xz
+          tar xJf /tmp/curl-h3.tar.xz -C /tmp
+          sudo mv /tmp/curl /usr/local/bin/curl
           curl --version | head -1
-          curl --version | grep -i 'http3\|HTTP3' && echo "HTTP/3: YES" || echo "HTTP/3: checking..."
+          curl --version | grep -i 'http3\|HTTP3' && echo "HTTP/3: YES" || echo "HTTP/3: NOT FOUND"
       - name: Run lab worker
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
