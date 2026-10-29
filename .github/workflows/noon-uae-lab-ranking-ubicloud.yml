@@ -37,18 +37,15 @@ jobs:
           echo "=== Runner IP ==="
           curl -s https://api.ipify.org
           echo ""
-          echo "=== DNS resolve api-app-st.noon.com ==="
-          dig +short api-app-st.noon.com || nslookup api-app-st.noon.com || echo "dig/nslookup not available"
-          echo "=== DNS resolve www.noon.com ==="
-          dig +short www.noon.com || nslookup www.noon.com || echo "dig/nslookup not available"
-          echo "=== curl -v noon whoami (10s timeout) ==="
-          curl -v --max-time 10 -H "User-Agent: noon/22098" https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami 2>&1 || true
+          echo "=== HTTP/2 (default) — whoami ==="
+          curl -s -o /dev/null -w "http2: status=%{http_code} time=%{time_total}s\n" --max-time 10 -H "User-Agent: noon/22098" https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami 2>&1 || echo "http2: failed"
+          echo "=== HTTP/1.1 — whoami ==="
+          curl -s -o /dev/null -w "http1.1: status=%{http_code} time=%{time_total}s\n" --http1.1 --max-time 10 -H "User-Agent: noon/22098" https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami 2>&1 || echo "http1.1: failed"
+          echo "=== HTTP/1.1 verbose — whoami ==="
+          curl -v --http1.1 --max-time 10 -H "User-Agent: noon/22098" https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami 2>&1 || true
           echo ""
-          echo "=== curl -v www.noon.com (10s timeout) ==="
-          curl -v --max-time 10 https://www.noon.com/ 2>&1 | head -30 || true
-          echo ""
-          echo "=== curl -v noon food search endpoint (10s timeout) ==="
-          curl -v --max-time 10 https://api-app-fd.noon.com/_svc/mp-food-api-catalog/api/search 2>&1 || true
+          echo "=== HTTP/1.1 — food search ==="
+          curl -s -o /dev/null -w "http1.1 food: status=%{http_code} time=%{time_total}s\n" --http1.1 --max-time 10 https://api-app-fd.noon.com/_svc/mp-food-api-catalog/api/search 2>&1 || echo "http1.1 food: failed"
       - name: Run lab worker
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
