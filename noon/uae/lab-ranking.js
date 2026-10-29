@@ -318,49 +318,177 @@ async function noonFetch(step, url, opts) {
 // identity = saved phone from the claim, or null for a fresh random one
 function pickIds(mode, identity) {
   if (identity && identity.device_id) return { deviceId: identity.device_id, visitorId: identity.visitor_id };
-  const up = String(mode || '').endsWith('-upper');
-  const f = (u) => (up ? u.toUpperCase() : u);
-  return { deviceId: f(crypto.randomUUID()), visitorId: f(crypto.randomUUID()) };
+  // Real iPhone uses UPPERCASE UUIDs
+  return { deviceId: crypto.randomUUID().toUpperCase(), visitorId: crypto.randomUUID().toUpperCase() };
 }
+
+// -- Full session simulation (matches real Noon iOS app traffic) ---------------
+// Based on Proxyman capture of real app: 52 API calls across 44 seconds before search.
+// Phase 1: App launch (ecom home) → Phase 2: Food tab → Phase 3: Browse → Phase 4: Search
+const APP_BASE   = 'https://api-app.noon.com';
+const FD_BASE    = 'https://api-app-fd.noon.com';
 
 async function mintToken(lat, lng, ids, flow) {
   const { deviceId, visitorId } = ids;
   const jar = {};
-  const sentryId = crypto.randomUUID().replace(/-/g, '');
+  const sentryId = () => crypto.randomUUID().replace(/-/g, '');
+  const sTrace = () => { const s = sentryId(); return { 'sentry-trace': `${s}-${crypto.randomUUID().replace(/-/g,'').slice(0,16)}`, baggage: `sentry-environment=production,sentry-public_key=d61e4de762b3c36e7c14f2d7cf6030c1,sentry-release=com.noon.buyerapp%405.261024%2B${BUILD},sentry-trace_id=${s}` }; };
   const base = () => ({
     'User-Agent': UA, 'x-platform': 'ios', 'x-build': BUILD, 'x-mp': 'noon', 'x-content': 'mobile',
-    Accept: 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Cache-Control': 'no-cache',
-    'x-device-id': deviceId, 'x-visitor-id': visitorId,
-    'sentry-trace': `${sentryId}-${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
-    baggage: `sentry-environment=production,sentry-public_key=d61e4de762b3c36e7c14f2d7cf6030c1,sentry-release=com.noon.buyerapp%405.261024%2B${BUILD},sentry-trace_id=${sentryId}`,
+    Accept: 'application/json, text/plain, */*', 'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br', 'Cache-Control': 'no-cache',
+    'x-device-id': deviceId, 'x-visitor-id': visitorId, ...sTrace(),
   });
+  const ck = () => cookieStr(jar);
+  const ecomH = () => ({ ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae',
+    'x-device-lat': String(lat), 'x-device-lng': String(lng), Cookie: ck() });
+
+  // --- PHASE 1: App launch (ecom home screen) ---
+  log('phase 1: app launch');
+
+  // 1. whoami (first call, no cookies)
   const r1 = await noonFetch('mint_whoami', WHOAMI_URL, {
     headers: { ...base(), 'x-experience': 'ecom', 'x-whoami-request-id': crypto.randomUUID() } });
   if (!r1.ok) throw fail('mint_whoami', r1.status);
   mergeSetCookies(jar, r1);
-  await sleep(between(flow.launch));
 
+  // 7.3s gap (app rendering splash screen)
+  await sleep(between([6000, 8000]));
+
+  // 2. set-location
   const r2 = await noonFetch('mint_set_location', SET_LOCATION_URL, {
-    method: 'POST',
-    headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae', 'x-device-lat': String(lat),
-      'x-device-lng': String(lng), 'Content-Type': 'application/json', Cookie: cookieStr(jar) },
+    method: 'POST', headers: { ...ecomH(), 'Content-Type': 'application/json' },
     body: JSON.stringify({ location: { lat, lng }, lang: 'en' }) });
   if (!r2.ok) throw fail('mint_set_location', r2.status);
   mergeSetCookies(jar, r2);
-  await sleep(between(flow.loc));
 
+  // 3. whoami-food (541ms gap)
+  await sleep(between([400, 700]));
   const r3 = await noonFetch('mint_whoami_food', WHOAMI_FOOD_URL, {
-    headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae', 'x-device-lat': String(lat),
-      'x-device-lng': String(lng), 'x-whoami-request-id': crypto.randomUUID(), Cookie: cookieStr(jar) } });
+    headers: { ...ecomH(), 'x-whoami-request-id': crypto.randomUUID() } });
   if (!r3.ok) throw fail('mint_whoami_food', r3.status);
   const who = await r3.json().catch(() => ({}));
   mergeSetCookies(jar, r3);
   if (!jar.nguestv2) throw fail('mint_whoami_food', null, { message: 'mint produced no nguestv2' });
   session = { deviceId, visitorId, jar, mintedAt: Date.now() };
-  return who && who.headers && typeof who.headers === 'object' ? who.headers : {};
+
+  // 4-7. Ecom home calls (membership, catalog, splash, touchpoints) — rapid burst
+  await sleep(between([200, 400]));
+  const warmup1 = [
+    noonFetch('warmup_membership', `${APP_BASE}/_svc/mp-vip-api-v1/membership?primaryUphoneCode=none`, { headers: ecomH() }),
+    noonFetch('warmup_catalog', `${APP_BASE}/_svc/catalog/api/v3/u/`, { headers: ecomH() }),
+  ];
+  await Promise.allSettled(warmup1);
+  mergeSetCookies(jar, { headers: { getSetCookie: () => [] } }); // just in case
+
+  // 5.9s gap (app loading home UI)
+  await sleep(between([4000, 7000]));
+
+  // 8-9. configs + cart
+  const warmup2 = [
+    noonFetch('warmup_configs', `${APP_BASE}/_svc/configs-v1/configs`, { headers: ecomH() }),
+    noonFetch('warmup_cart', `${APP_BASE}/_svc/cart-v1/cart`, { headers: ecomH() }),
+  ];
+  await Promise.allSettled(warmup2);
+
+  // 10-18. Ads + catalog widgets (rapid burst)
+  await sleep(between([150, 300]));
+  const warmup3 = [
+    noonFetch('warmup_ads', `${APP_BASE}/_svc/mp-ads-api-adserver/ads/get-by-slot-codes`, {
+      method: 'POST', headers: { ...ecomH(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(['ocm_ae_mb_homepage_in_the_spotlight_1','ocm_ae_mb_homepage_in_the_spotlight_2']) }),
+    noonFetch('warmup_catalog2', `${APP_BASE}/_svc/catalog/api/v3/u/?limit=18`, { headers: ecomH() }),
+  ];
+  await Promise.allSettled(warmup3);
+  log('phase 1 done (ecom home loaded)');
+
+  // --- PHASE 2: User taps Food tab (1.6s gap) ---
+  await sleep(between([1200, 2000]));
+  log('phase 2: food tab');
+
+  const foodH = () => ({ ...base(), 'x-experience': 'food', 'x-locale': 'en-ae',
+    'x-device-lat': String(lat), 'x-device-lng': String(lng), Cookie: ck() });
+
+  // 19-24. Food home burst (0-7ms between calls in real app)
+  const foodBurst = [
+    noonFetch('food_home', `${FD_BASE}/_svc/mp-food-api-catalog/api/`, { headers: foodH() }),
+    noonFetch('food_popups', `${FD_BASE}/_svc/mp-food-api-catalog/api/popups`, { headers: foodH() }),
+    noonFetch('food_whoami', `${FD_BASE}/_svc/mp-food-api-catalog/api/customer/whoami`, { headers: foodH() }),
+    noonFetch('food_suggestions', `${FD_BASE}/_svc/mp-food-api-catalog/api/page/suggestions`, { headers: foodH() }),
+    noonFetch('food_favorites', `${FD_BASE}/_svc/mp-food-api-catalog/api/customer/favorite/restaurants`, { headers: foodH() }),
+    noonFetch('food_navbar', `${FD_BASE}/_svc/mp-food-api-catalog/api/customer/navbar-tabs-config`, { headers: foodH() }),
+  ];
+  await Promise.allSettled(foodBurst);
+
+  // 25-32. Homepage + carousel searches (919ms gap then burst)
+  await sleep(between([700, 1200]));
+  const zh = who && who.headers && typeof who.headers === 'object' ? who.headers : {};
+  const searchH = () => {
+    const h = { ...foodH(), 'x-mp-country': 'ae',
+      'x-lat': String(Math.round(lat * 1e7)), 'x-lng': String(Math.round(lng * 1e7)),
+      'x-border-enabled': 'true', 'x-rocket-enabled': 'true' };
+    for (const [k, v] of Object.entries(zh)) { if (v != null && typeof v !== 'object') h[k] = String(v); }
+    return h;
+  };
+  const carouselBurst = [
+    noonFetch('food_homepage_dyn', `${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/dynamic`, { headers: searchH() }),
+    noonFetch('food_homepage_static', `${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/static`, { headers: searchH() }),
+    noonFetch('food_carousel1', `${FD_BASE}/_svc/mp-food-api-catalog/api/search?queryEntity%5BentityType%5D=outlet_carousel_tab&queryEntity%5BentityCode%5D=recommended_new_user_carousel_tab&f%5Bserviceable%5D=1&withContent=False&limit=20&content=home&type=outlet`, { headers: searchH() }),
+    noonFetch('food_banners', `${FD_BASE}/_svc/mp-food-api-catalog/api/admon/content-ad/banner-carousel?entity_type=food_banner_module&entity_code=homepage_hero_banner_ads_carousel_ae&limit=20&min_assets=2`, { headers: searchH() }),
+    noonFetch('food_carousel2', `${FD_BASE}/_svc/mp-food-api-catalog/api/search?queryEntity%5BentityType%5D=outlet_carousel_tab&queryEntity%5BentityCode%5D=homepage_carousel_featured_tab&f%5Btags%5D=listing_ad&f%5Bserviceable%5D=1&withContent=False&limit=20&content=home&type=outlet`, { headers: searchH() }),
+  ];
+  await Promise.allSettled(carouselBurst);
+
+  // 31-32. Content search + reels
+  await sleep(between([150, 350]));
+  await Promise.allSettled([
+    noonFetch('food_content', `${FD_BASE}/_svc/mp-food-api-catalog/api/search?content=noon_food_garnierkiwi&get_fallback=false`, { headers: searchH() }),
+    noonFetch('food_reels', `${FD_BASE}/_svc/mp-food-api-catalog/api/reels`, { headers: searchH() }),
+  ]);
+  log('phase 2 done (food home loaded)');
+
+  // --- PHASE 3: User browses food home (3-9 seconds of looking around) ---
+  await sleep(between([1000, 1500]));
+  log('phase 3: browsing');
+
+  // 33-36. Refresh whoami + homepage
+  await Promise.allSettled([
+    noonFetch('browse_whoami', WHOAMI_URL, { headers: { ...base(), 'x-experience': 'ecom', Cookie: ck() } }),
+    noonFetch('browse_food_whoami', `${FD_BASE}/_svc/mp-food-api-catalog/api/customer/whoami`, { headers: foodH() }),
+    noonFetch('browse_homepage_dyn', `${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/dynamic`, { headers: searchH() }),
+  ]);
+
+  // 3.4s gap (user looking at food home)
+  await sleep(between([2500, 4500]));
+
+  // 37-38. Personalization
+  await noonFetch('browse_prefs', `${FD_BASE}/_svc/mp-food-api-catalog/api/personalization/preferences/get-options`, {
+    method: 'POST', headers: { ...searchH(), 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
+  await sleep(between([200, 400]));
+  await noonFetch('browse_prefs_init', `${FD_BASE}/_svc/mp-food-api-catalog/api/personalization/preferences/init`, {
+    method: 'POST', headers: { ...searchH(), 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
+
+  // 3.0s gap (user still browsing)
+  await sleep(between([2000, 4000]));
+
+  // 39-48. Reload food home + carousels again (user came back to food home)
+  await Promise.allSettled([
+    noonFetch('browse_light', `${FD_BASE}/_svc/mp-food-api-catalog/api/light/`, { headers: searchH() }),
+    noonFetch('browse_home2', `${FD_BASE}/_svc/mp-food-api-catalog/api/`, { headers: foodH() }),
+  ]);
+  await sleep(between([300, 600]));
+  await Promise.allSettled([
+    noonFetch('browse_hp_dyn2', `${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/dynamic`, { headers: searchH() }),
+    noonFetch('browse_carousel3', `${FD_BASE}/_svc/mp-food-api-catalog/api/search?queryEntity%5BentityType%5D=outlet_carousel_tab&queryEntity%5BentityCode%5D=recommended_new_user_carousel_tab&f%5Bserviceable%5D=1&withContent=False&limit=20&content=home&type=outlet`, { headers: searchH() }),
+    noonFetch('browse_reels2', `${FD_BASE}/_svc/mp-food-api-catalog/api/reels`, { headers: searchH() }),
+  ]);
+  log('phase 3 done (user browsed food home)');
+
+  // 9.3s gap before search (user decides to tap "See All")
+  await sleep(between([7000, 11000]));
+  log('phase 4: user taps See All → search');
+
+  return zh;
 }
 
 function hdrs(lat, lng) {
@@ -409,8 +537,14 @@ async function fetchPage(loc, searchToken) {
   }
   const body = {
     queryEntity: null, q: null, f: {}, contexts: [], withContent: true, excludeOutletCodes: [],
-    limit: PAGE_LIMIT, page: 1, sort: { by: 'popularity', dir: 'desc' }, type: 'outlet',
-    qType: 'search_query', getFallback: true,
+    limit: PAGE_LIMIT, scopes: null, page: 1, dishTags: [], ratingMin: null,
+    sort: { by: 'popularity', dir: 'desc', slab: null },
+    widgets: null, content: null, withHits: false, filteredByWidget: null,
+    internalFilteredByWidget: 'homepage_navpill_filters_widget',
+    getFallback: true, type: 'outlet', qType: 'search_query',
+    minCount: 0, groupDishes: false, isSsc: false,
+    hideSearchBar: false, hideSearchOptions: false,
+    isOutletAdProcessingEnabled: true, withDishFetchQuery: null,
   };
   if (searchToken) body.searchToken = searchToken;
   const resp = await noonFetch('search', SEARCH_URL, { method: 'POST', headers, body: JSON.stringify(body) });
