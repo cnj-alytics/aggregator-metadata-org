@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: '0'
+      http3_only:
+        description: 'HTTP/3 only via curl QUIC/UDP (set to 1)'
+        required: false
+        type: string
+        default: '0'
       max_areas:
         description: 'Max areas per machine (default 10)'
         required: false
@@ -64,6 +69,7 @@ jobs:
           HTTP1_ONLY: ${{ inputs.http1_only }}
           HTTP10_MODE: ${{ inputs.http10_mode }}
           ADAPTIVE_HTTP: ${{ inputs.adaptive_http }}
+          HTTP3_ONLY: ${{ inputs.http3_only }}
           MAX_AREAS: ${{ inputs.max_areas }}
         run: |
           npm install undici
