@@ -54,6 +54,7 @@ const undici = require('undici');
 
 // -- Protocol level (mutable in adaptive mode) --------------------------------
 // 'h2' = Node default (negotiates HTTP/2), 'h1.1' = HTTP/1.1 only, 'h1.0' = fresh TCP per request
+const ALL_PROTOCOLS = ['h2', 'h1.1', 'h1.0'];
 let _httpLevel = HTTP10_MODE ? 'h1.0' : (HTTP1_ONLY ? 'h1.1' : 'h2');
 let _h11Agent  = null;           // lazy-created, reused within one level stint
 let proxyDispatcher = null;
@@ -215,16 +216,35 @@ function fail(step, status, extra = {}) {
   return Object.assign(new Error(`${step} ${status ? 'HTTP ' + status : ''}`.trim()), { step, status, kind, ...extra });
 }
 async function noonFetch(step, url, opts) {
-  let r; const t0 = Date.now(); requests++;
-  try { r = await proxyFetch(url, { ...opts, signal: AbortSignal.timeout(30000), ...proxyOpt() }); }
-  catch (e) {
-    const chain = errorChain(e);
-    log(`${step} fetch error (${Date.now() - t0}ms): ${chain}`);
-    throw Object.assign(fail(step, null), { message: `${step} network: ${chain}` });
+  // In adaptive mode: if a request gets 403, retry it with the next protocol down.
+  // Keeps the same cookies/session — only the transport changes.
+  // h2 → h1.1 → h1.0. Once a lower level works, it sticks for subsequent calls.
+  const levels = ADAPTIVE_HTTP
+    ? ALL_PROTOCOLS.slice(ALL_PROTOCOLS.indexOf(_httpLevel))   // from current level down
+    : [_httpLevel];
+
+  for (let i = 0; i < levels.length; i++) {
+    const level = levels[i];
+    if (i > 0) {                                               // protocol downgrade
+      _httpLevel = level; _h11Agent = null;
+      log(`${step} retrying on ${level}...`);
+    }
+    let r; const t0 = Date.now(); requests++;
+    try { r = await proxyFetch(url, { ...opts, signal: AbortSignal.timeout(30000), ...proxyOpt() }); }
+    catch (e) {
+      const chain = errorChain(e);
+      log(`${step} fetch error on ${level} (${Date.now() - t0}ms): ${chain}`);
+      if (ADAPTIVE_HTTP && i < levels.length - 1) continue;   // network error → try next protocol
+      throw Object.assign(fail(step, null), { message: `${step} network: ${chain}` });
+    }
+    try { logRequest(step, url, opts, r, Date.now() - t0); } catch (_) {}
+    if ((r.status === 403 || r.status === 429) && ADAPTIVE_HTTP && i < levels.length - 1) {
+      log(`${step} ${r.status} on ${level} — dropping to ${levels[i + 1]}...`);
+      continue;                                                // 403 → try next protocol
+    }
+    if (r.status === 403 || r.status === 429) { await captureBlock(step, r); throw fail(step, r.status); }
+    return r;
   }
-  try { logRequest(step, url, opts, r, Date.now() - t0); } catch (_) {}
-  if (r.status === 403 || r.status === 429) { await captureBlock(step, r); throw fail(step, r.status); }
-  return r;
 }
 
 // identity = saved phone from the claim, or null for a fresh random one
@@ -341,9 +361,11 @@ async function fetchPage(loc, searchToken) {
   }
 
   // -- Area loop: up to MAX_AREAS claims per machine --------------------------
-  const ALL_PROTOCOLS = ['h2', 'h1.1', 'h1.0'];
   let areasCompleted = 0;
   for (let areaNum = 1; areaNum <= MAX_AREAS; areaNum++) {
+    // In adaptive mode, reset to H2 so each area gets a fresh shot at the fastest protocol.
+    // noonFetch will auto-downgrade per-request if a step gets 403.
+    if (ADAPTIVE_HTTP) { _httpLevel = 'h2'; _h11Agent = null; }
     resetAreaState();
 
     const claim = await rpc('noon_lab_claim', { p_test_id: TEST_ID, p_machine_no: MACHINE, p_github_run_id: GH_RUN_ID, p_runner_ip: ip });
@@ -353,71 +375,52 @@ async function fetchPage(loc, searchToken) {
     const mode = claim.identity_mode || 'fresh-lower';
     const flowName = FLOWS[claim.flow] ? claim.flow : 'A';
     const flow = FLOWS[flowName];
+    const ids = pickIds(mode, claim.identity);
     log(`area ${areaNum}/${MAX_AREAS}: id=${claim.noon_area_id} (${claim.area_name}, usually ${claim.usual_pages}p) delay=${delay}ms attempt=${claim.attempt}`);
+    log(`flow ${flowName} identity ${mode} device=${ids.deviceId}${ADAPTIVE_HTTP ? ' [adaptive h2→h1.1→h1.0]' : ''}`);
 
-    // -- Protocol cascade: in adaptive mode, try h2 → h1.1 → h1.0 per area ---
-    const protocols = ADAPTIVE_HTTP ? ALL_PROTOCOLS : [_httpLevel];
-    let result = {};
-
-    for (let pi = 0; pi < protocols.length; pi++) {
-      const proto = protocols[pi];
-      const isLast = pi === protocols.length - 1;
-      if (ADAPTIVE_HTTP) { _httpLevel = proto; _h11Agent = null; }
-      resetAreaState();
-
-      const ids = pickIds(mode, claim.identity);  // fresh identity per protocol attempt
-      log(`${ADAPTIVE_HTTP ? `[${proto}] ` : ''}flow ${flowName} identity ${mode} device=${ids.deviceId}`);
-
-      const t0 = Date.now();
-      const pageMs = [];
-      const seen = new Set();
-      let setupMs = null, page = 0, stopReason = null;
-      result = {};
-      try {
-        const mintZh = await mintToken(lat, lng, ids, flow);
-        const loc = flow.locate ? await locate(lat, lng) : { lat, lng, zh: mintZh, cookie: cookieStr(session.jar) };
-        await sleep(between(flow.list));
-        setupMs = Date.now() - t0;
-        let searchToken = null;
-        while (page < PAGE_CAP) {
-          page++;
-          const p0 = Date.now();
-          const r = await fetchPage(loc, searchToken);
-          pageMs.push(Date.now() - p0);
-          const fresh = r.outlets.filter((o) => !seen.has(o.outletCode));
-          for (const o of fresh) seen.add(o.outletCode);
-          if (r.outlets.length === 0) { stopReason = `empty@${page}`; break; }
-          if (fresh.length === 0)     { stopReason = `no-new@${page}`; break; }
-          if (!r.token)               { stopReason = `no-token@${page}`; break; }
-          searchToken = r.token;
-          if (Date.now() - t0 > TIME_CAP_MS) { stopReason = `time-cap@${page}`; break; }
-          await sleep(flow === FLOWS.A ? delay : between(flow.gap));
-        }
-        if (!stopReason) stopReason = `cap(${PAGE_CAP})`;
-        Object.assign(result, { outcome: 'ok', pages_done: page, stop_reason: stopReason });
-      } catch (e) {
-        const isBlocked = e.kind === 'blocked' || e.kind === 'rate_limited';
-        if (isBlocked && ADAPTIVE_HTTP && !isLast) {
-          log(`[${proto}] blocked at ${e.step} — downgrading to ${protocols[pi + 1]}...`);
-          await sleep(1000);
-          continue;  // try next protocol
-        }
-        Object.assign(result, {
-          outcome: e.kind || 'error', fail_step: e.step || 'other', http_status: e.status || null,
-          fail_page: e.step === 'search' ? page : null, pages_done: e.step === 'search' ? page - 1 : 0,
-          error: String(e.message).slice(0, 500),
-        });
+    const t0 = Date.now();
+    const pageMs = [];
+    const seen = new Set();
+    let setupMs = null, page = 0, stopReason = null;
+    const result = {};
+    try {
+      const mintZh = await mintToken(lat, lng, ids, flow);
+      const loc = flow.locate ? await locate(lat, lng) : { lat, lng, zh: mintZh, cookie: cookieStr(session.jar) };
+      await sleep(between(flow.list));
+      setupMs = Date.now() - t0;
+      log(`setup done in ${setupMs}ms [${_httpLevel}]`);
+      let searchToken = null;
+      while (page < PAGE_CAP) {
+        page++;
+        const p0 = Date.now();
+        const r = await fetchPage(loc, searchToken);
+        pageMs.push(Date.now() - p0);
+        const fresh = r.outlets.filter((o) => !seen.has(o.outletCode));
+        for (const o of fresh) seen.add(o.outletCode);
+        if (r.outlets.length === 0) { stopReason = `empty@${page}`; break; }
+        if (fresh.length === 0)     { stopReason = `no-new@${page}`; break; }
+        if (!r.token)               { stopReason = `no-token@${page}`; break; }
+        searchToken = r.token;
+        if (Date.now() - t0 > TIME_CAP_MS) { stopReason = `time-cap@${page}`; break; }
+        await sleep(flow === FLOWS.A ? delay : between(flow.gap));
       }
+      if (!stopReason) stopReason = `cap(${PAGE_CAP})`;
+      Object.assign(result, { outcome: 'ok', pages_done: page, stop_reason: stopReason });
+    } catch (e) {
       Object.assign(result, {
-        cards: seen.size, setup_ms: setupMs, elapsed_ms: Date.now() - t0, page_ms: pageMs,
-        token_age_ms: session ? Date.now() - session.mintedAt : null,
-        device_id: ids.deviceId, cookies: reqLog, block_info: blockInfo, flow: flowName, requests,
-        http_protocol: proto,
+        outcome: e.kind || 'error', fail_step: e.step || 'other', http_status: e.status || null,
+        fail_page: e.step === 'search' ? page : null, pages_done: e.step === 'search' ? page - 1 : 0,
+        error: String(e.message).slice(0, 500),
       });
-      break;  // either success or final failure — stop trying protocols
     }
-
-    log(`area ${areaNum} → ${result.outcome} ${result.fail_step || ''} pages=${result.pages_done} cards=${result.cards} ${result.elapsed_ms}ms [${result.http_protocol}]`);
+    Object.assign(result, {
+      cards: seen.size, setup_ms: setupMs, elapsed_ms: Date.now() - t0, page_ms: pageMs,
+      token_age_ms: session ? Date.now() - session.mintedAt : null,
+      device_id: ids.deviceId, cookies: reqLog, block_info: blockInfo, flow: flowName, requests,
+      http_protocol: _httpLevel,   // the level that was active at the end (lowest used)
+    });
+    log(`area ${areaNum} → ${result.outcome} ${result.fail_step || ''} pages=${result.pages_done} cards=${result.cards} ${result.elapsed_ms}ms [${_httpLevel}]`);
     await rpc('noon_lab_report', { p_test_id: TEST_ID, p_machine_no: MACHINE, p_item_id: itemId, p_result: result });
     areasCompleted++;
 
