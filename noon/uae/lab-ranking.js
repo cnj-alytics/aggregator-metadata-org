@@ -95,7 +95,7 @@ const SEARCH_URL       = 'https://api-app-fd.noon.com/_svc/mp-food-api-catalog/a
 const PAGE_LIMIT = 60;
 const PAGE_CAP   = 150;
 const TIME_CAP_MS = 9 * 60 * 1000;
-const MAX_AREAS  = 10;
+const MAX_AREAS  = Number(process.env.MAX_AREAS) || 10;
 const FLOWS = {
   A: { locate: true,  launch: null,         loc: null,         list: null,          gap: [500, 500] },
   B: { locate: false, launch: null,         loc: null,         list: null,          gap: [500, 500] },
