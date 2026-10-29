@@ -50,7 +50,9 @@ const PROXY_URL    = process.env.PROXY_URL || '';
 const HTTP1_ONLY   = process.env.HTTP1_ONLY   === '1';  // force HTTP/1.1 (no HTTP/2)
 const HTTP10_MODE  = process.env.HTTP10_MODE  === '1';  // HTTP/1.0 style: fresh TCP+TLS per request
 const ADAPTIVE_HTTP = process.env.ADAPTIVE_HTTP === '1'; // smart cascade: h2 → h1.1 → h1.0
+const HTTP3_ONLY   = process.env.HTTP3_ONLY   === '1';  // HTTP/3 via curl (QUIC/UDP)
 const undici = require('undici');
+const { execFileSync: _execFile } = require('child_process');
 
 // -- Protocol level (mutable in adaptive mode) --------------------------------
 // 'h2' = Node default (negotiates HTTP/2), 'h1.1' = HTTP/1.1 only, 'h1.0' = fresh TCP per request
@@ -99,6 +101,48 @@ const proxyOpt = () => {
   return { dispatcher: new undici.Agent({ allowH2: false, connections: 1, pipelining: 0,
     keepAliveTimeout: 10, keepAliveMaxTimeout: 10 }) };
 };
+
+// -- HTTP/3 via curl (QUIC/UDP) -----------------------------------------------
+// Node.js doesn't support HTTP/3 natively, so we shell out to curl --http3-only.
+// Returns a Response-like object the existing code can consume.
+function _curlH3(url, opts) {
+  const args = ['--http3-only', '-s', '-i', '--max-time', '30'];
+  const headers = opts.headers || {};
+  for (const [k, v] of Object.entries(headers)) args.push('-H', `${k}: ${v}`);
+  if (opts.method && opts.method.toUpperCase() === 'POST') {
+    args.push('-X', 'POST');
+    if (opts.body) args.push('--data-raw', opts.body);
+  }
+  args.push('--', url);
+  const raw = _execFile('curl', args, { encoding: 'utf-8', timeout: 35000 });
+
+  // Parse curl -i output: status line + headers + \r\n\r\n + body
+  const sep = raw.indexOf('\r\n\r\n') >= 0 ? '\r\n\r\n' : '\n\n';
+  const si = raw.indexOf(sep);
+  const hBlock = si >= 0 ? raw.substring(0, si) : raw;
+  const body   = si >= 0 ? raw.substring(si + sep.length) : '';
+  const hLines = hBlock.split(/\r?\n/);
+  const status = parseInt((hLines[0] || '').split(' ')[1]) || 0;
+  const hMap = new Map();
+  const setCookies = [];
+  for (const ln of hLines.slice(1)) {
+    const ci = ln.indexOf(': ');
+    if (ci < 0) continue;
+    const k = ln.substring(0, ci), v = ln.substring(ci + 2);
+    if (k.toLowerCase() === 'set-cookie') setCookies.push(v);
+    else hMap.set(k.toLowerCase(), v);
+  }
+  return {
+    status, ok: status >= 200 && status < 300,
+    headers: {
+      get: (k) => hMap.get(k.toLowerCase()) || null,
+      getSetCookie: () => setCookies,
+      forEach: (fn) => { hMap.forEach((v, k) => fn(v, k)); setCookies.forEach(c => fn(c, 'set-cookie')); },
+    },
+    json: async () => JSON.parse(body),
+    text: async () => body,
+  };
+}
 
 // -- Error diagnostics --------------------------------------------------------
 function errorChain(e) {
@@ -216,6 +260,19 @@ function fail(step, status, extra = {}) {
   return Object.assign(new Error(`${step} ${status ? 'HTTP ' + status : ''}`.trim()), { step, status, kind, ...extra });
 }
 async function noonFetch(step, url, opts) {
+  // -- HTTP/3 via curl (completely separate transport: QUIC/UDP) ---------------
+  if (HTTP3_ONLY) {
+    let r; const t0 = Date.now(); requests++;
+    try { r = _curlH3(url, opts); }
+    catch (e) {
+      log(`${step} curl h3 error (${Date.now() - t0}ms): ${e.message.split('\n')[0]}`);
+      throw Object.assign(fail(step, null), { message: `${step} h3: ${e.message.split('\n')[0]}` });
+    }
+    try { logRequest(step, url, opts, r, Date.now() - t0); } catch (_) {}
+    if (r.status === 403 || r.status === 429) { await captureBlock(step, r); throw fail(step, r.status); }
+    return r;
+  }
+  // -- Adaptive / fixed protocol (TCP-based: h2, h1.1, h1.0) -----------------
   // In adaptive mode: if a request gets 403, retry it with the next protocol down.
   // Keeps the same cookies/session — only the transport changes.
   // h2 → h1.1 → h1.0. Once a lower level works, it sticks for subsequent calls.
@@ -349,6 +406,23 @@ async function fetchPage(loc, searchToken) {
 // -- Main -------------------------------------------------------------------
 
 (async () => {
+  // -- HTTP/3 diagnostic (once per machine) -----------------------------------
+  if (HTTP3_ONLY) {
+    try {
+      const ver = _execFile('curl', ['--version'], { encoding: 'utf-8', timeout: 5000 });
+      console.log(`[h3] ${ver.split('\n')[0]}`);
+      console.log(`[h3] HTTP/3: ${/http3|HTTP3|nghttp3|quiche/.test(ver) ? 'YES' : 'not detected in features (will try anyway)'}`);
+    } catch (e) { console.log(`[h3] curl check failed: ${e.message}`); }
+    // Quick test: can curl talk HTTP/3 to Noon?
+    try {
+      const t0 = Date.now();
+      const out = _execFile('curl', ['--http3-only', '-s', '-o', '/dev/null', '-w', '%{http_code} %{http_version}',
+        '--max-time', '10', '-H', `User-Agent: ${UA}`, 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami'],
+        { encoding: 'utf-8', timeout: 15000 });
+      console.log(`[h3] probe noon whoami: ${out.trim()} (${Date.now() - t0}ms)`);
+    } catch (e) { console.log(`[h3] probe failed: ${e.message.split('\n')[0]}`); }
+  }
+
   // -- Proxy connectivity check (once per machine) ----------------------------
   let ip = null;
   try {
