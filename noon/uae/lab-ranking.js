@@ -47,7 +47,8 @@ if (!SUPABASE_URL || !SUPABASE_KEY || !TEST_ID || !MACHINE) {
 // Each machine gets its own port for a unique sticky IP.
 // Decodo UAE ports: 20001-20010. PROXY_URL base port is the starting port.
 const PROXY_URL = process.env.PROXY_URL || '';
-const HTTP1_ONLY = process.env.HTTP1_ONLY === '1';  // force HTTP/1.1 (no HTTP/2)
+const HTTP1_ONLY  = process.env.HTTP1_ONLY  === '1';  // force HTTP/1.1 (no HTTP/2)
+const HTTP10_MODE = process.env.HTTP10_MODE === '1';  // HTTP/1.0 style: fresh TCP+TLS per request
 let proxyDispatcher = null;
 let proxyFetch = globalThis.fetch;          // default: Node built-in fetch
 const undici = require('undici');
@@ -66,13 +67,27 @@ if (PROXY_URL) {
   proxyDispatcher = new undici.ProxyAgent(agentOpts);
   proxyFetch = undici.fetch;                // must use undici's own fetch so the dispatcher matches
   console.log(`[proxy] machine ${MACHINE} routing through ${proxyOrigin} (auth: ${pu.username ? 'yes' : 'none'})`);
+} else if (HTTP10_MODE) {
+  // HTTP/1.0 style: fresh TCP+TLS connection per request (no keep-alive).
+  // Each request creates a brand-new Agent so no connection is reused.
+  // This makes every request look like a completely independent client to Akamai.
+  proxyFetch = undici.fetch;
+  console.log(`[http] forcing HTTP/1.0 style (fresh TCP+TLS per request, no keep-alive)`);
 } else if (HTTP1_ONLY) {
-  // Force HTTP/1.1 by using undici Agent with allowH2 disabled
+  // Force HTTP/1.1 by using undici Agent with allowH2 disabled (connections reused)
   proxyDispatcher = new undici.Agent({ allowH2: false });
   proxyFetch = undici.fetch;
   console.log(`[http] forcing HTTP/1.1 (no H2)`);
 }
-const proxyOpt = () => (proxyDispatcher ? { dispatcher: proxyDispatcher } : {});
+// For HTTP/1.0 mode: a throwaway single-use Agent per request → fresh TCP+TLS each time.
+// Otherwise reuse the persistent dispatcher.
+const proxyOpt = () => {
+  if (HTTP10_MODE) {
+    return { dispatcher: new undici.Agent({ allowH2: false, connections: 1, pipelining: 0,
+      keepAliveTimeout: 10, keepAliveMaxTimeout: 10 }) };
+  }
+  return proxyDispatcher ? { dispatcher: proxyDispatcher } : {};
+};
 
 // -- Error diagnostics --------------------------------------------------------
 function errorChain(e) {
