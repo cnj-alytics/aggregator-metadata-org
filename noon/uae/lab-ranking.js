@@ -51,6 +51,7 @@ const HTTP1_ONLY   = process.env.HTTP1_ONLY   === '1';  // force HTTP/1.1 (no HT
 const HTTP10_MODE  = process.env.HTTP10_MODE  === '1';  // HTTP/1.0 style: fresh TCP+TLS per request
 const ADAPTIVE_HTTP = process.env.ADAPTIVE_HTTP === '1'; // smart cascade: h2 → h1.1 → h1.0
 const HTTP3_ONLY   = process.env.HTTP3_ONLY   === '1';  // HTTP/3 via curl (QUIC/UDP)
+const VARIED_DELAY = process.env.VARIED_DELAY === '1';  // human-like variable page timing
 const undici = require('undici');
 const { execFileSync: _execFile } = require('child_process');
 
@@ -174,6 +175,16 @@ const FLOWS = {
   E: { locate: false, launch: [2000, 4000], loc: [1000, 2000], list: [10000, 14000], gap: [4000, 10000] },
 };
 const between = (r) => (r ? r[0] + Math.floor(Math.random() * (r[1] - r[0] + 1)) : 0);
+
+// -- Human-like variable page timing ------------------------------------------
+// Odd pages: 500ms (quick scroll), even pages: 1250ms (pause to look),
+// prime pages ≥ 7: 3000ms (stopped to read a restaurant).
+function _isPrime(n) { if (n < 2) return false; for (let i = 2; i * i <= n; i++) if (n % i === 0) return false; return true; }
+function pageGap(page) {
+  if (page >= 7 && _isPrime(page)) return 3000;
+  if (page % 2 === 0) return 1250;
+  return 500;
+}
 
 // -- Per-area mutable state (reset between areas) -----------------------------
 let requests = 0;
@@ -492,7 +503,7 @@ async function fetchPage(loc, searchToken) {
         if (!r.token)               { stopReason = `no-token@${page}`; break; }
         searchToken = r.token;
         if (Date.now() - t0 > TIME_CAP_MS) { stopReason = `time-cap@${page}`; break; }
-        await sleep(flow === FLOWS.A ? delay : between(flow.gap));
+        await sleep(VARIED_DELAY ? pageGap(page) : (flow === FLOWS.A ? delay : between(flow.gap)));
       }
       if (!stopReason) stopReason = `cap(${PAGE_CAP})`;
       Object.assign(result, { outcome: 'ok', pages_done: page, stop_reason: stopReason });
