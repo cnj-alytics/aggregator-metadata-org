@@ -46,15 +46,20 @@ if (!SUPABASE_URL || !SUPABASE_KEY || !TEST_ID || !MACHINE) {
 // -- Proxy support (Decodo residential) ---------------------------------------
 // Each machine gets its own port for a unique sticky IP.
 // Decodo UAE ports: 20001-20010. PROXY_URL base port is the starting port.
-const PROXY_URL = process.env.PROXY_URL || '';
-const HTTP1_ONLY  = process.env.HTTP1_ONLY  === '1';  // force HTTP/1.1 (no HTTP/2)
-const HTTP10_MODE = process.env.HTTP10_MODE === '1';  // HTTP/1.0 style: fresh TCP+TLS per request
-let proxyDispatcher = null;
-let proxyFetch = globalThis.fetch;          // default: Node built-in fetch
+const PROXY_URL    = process.env.PROXY_URL || '';
+const HTTP1_ONLY   = process.env.HTTP1_ONLY   === '1';  // force HTTP/1.1 (no HTTP/2)
+const HTTP10_MODE  = process.env.HTTP10_MODE  === '1';  // HTTP/1.0 style: fresh TCP+TLS per request
+const ADAPTIVE_HTTP = process.env.ADAPTIVE_HTTP === '1'; // smart cascade: h2 → h1.1 → h1.0
 const undici = require('undici');
+
+// -- Protocol level (mutable in adaptive mode) --------------------------------
+// 'h2' = Node default (negotiates HTTP/2), 'h1.1' = HTTP/1.1 only, 'h1.0' = fresh TCP per request
+let _httpLevel = HTTP10_MODE ? 'h1.0' : (HTTP1_ONLY ? 'h1.1' : 'h2');
+let _h11Agent  = null;           // lazy-created, reused within one level stint
+let proxyDispatcher = null;
+
 if (PROXY_URL) {
   const pu = new URL(PROXY_URL);
-  // Assign unique port per machine: machine 1 → base port, machine 2 → base+1, etc.
   const basePort = parseInt(pu.port, 10) || 20001;
   const machinePort = basePort + MACHINE - 1;
   const proxyOrigin = `${pu.protocol}//${pu.hostname}:${machinePort}`;
@@ -65,28 +70,33 @@ if (PROXY_URL) {
     ).toString('base64')}`;
   }
   proxyDispatcher = new undici.ProxyAgent(agentOpts);
-  proxyFetch = undici.fetch;                // must use undici's own fetch so the dispatcher matches
   console.log(`[proxy] machine ${MACHINE} routing through ${proxyOrigin} (auth: ${pu.username ? 'yes' : 'none'})`);
+} else if (ADAPTIVE_HTTP) {
+  console.log(`[http] adaptive mode — will cascade h2 → h1.1 → h1.0 on 403`);
 } else if (HTTP10_MODE) {
-  // HTTP/1.0 style: fresh TCP+TLS connection per request (no keep-alive).
-  // Each request creates a brand-new Agent so no connection is reused.
-  // This makes every request look like a completely independent client to Akamai.
-  proxyFetch = undici.fetch;
   console.log(`[http] forcing HTTP/1.0 style (fresh TCP+TLS per request, no keep-alive)`);
 } else if (HTTP1_ONLY) {
-  // Force HTTP/1.1 by using undici Agent with allowH2 disabled (connections reused)
-  proxyDispatcher = new undici.Agent({ allowH2: false });
-  proxyFetch = undici.fetch;
   console.log(`[http] forcing HTTP/1.1 (no H2)`);
+} else {
+  console.log(`[http] default — HTTP/2 (Node built-in)`);
 }
-// For HTTP/1.0 mode: a throwaway single-use Agent per request → fresh TCP+TLS each time.
-// Otherwise reuse the persistent dispatcher.
+
+// Dynamic fetch + dispatcher based on current _httpLevel (or proxy)
+const proxyFetch = (url, opts) => {
+  if (proxyDispatcher) return undici.fetch(url, opts);   // proxy mode
+  if (_httpLevel === 'h2') return globalThis.fetch(url, opts); // Node default (H2)
+  return undici.fetch(url, opts);                        // h1.1 / h1.0
+};
 const proxyOpt = () => {
-  if (HTTP10_MODE) {
-    return { dispatcher: new undici.Agent({ allowH2: false, connections: 1, pipelining: 0,
-      keepAliveTimeout: 10, keepAliveMaxTimeout: 10 }) };
+  if (proxyDispatcher) return { dispatcher: proxyDispatcher };
+  if (_httpLevel === 'h2') return {};
+  if (_httpLevel === 'h1.1') {
+    if (!_h11Agent) _h11Agent = new undici.Agent({ allowH2: false });
+    return { dispatcher: _h11Agent };
   }
-  return proxyDispatcher ? { dispatcher: proxyDispatcher } : {};
+  // h1.0: throwaway single-use Agent → fresh TCP+TLS each time
+  return { dispatcher: new undici.Agent({ allowH2: false, connections: 1, pipelining: 0,
+    keepAliveTimeout: 10, keepAliveMaxTimeout: 10 }) };
 };
 
 // -- Error diagnostics --------------------------------------------------------
@@ -323,6 +333,7 @@ async function fetchPage(loc, searchToken) {
   let ip = null;
   try {
     const t0 = Date.now();
+    if (ADAPTIVE_HTTP) _httpLevel = 'h2';  // start ipify check with h2
     ip = (await (await proxyFetch('https://api.ipify.org', { signal: AbortSignal.timeout(8000), ...proxyOpt() })).text()).trim();
     console.log(`[proxy-check] ipify ok ${Date.now() - t0}ms ip=${ip}`);
   } catch (e) {
@@ -330,6 +341,7 @@ async function fetchPage(loc, searchToken) {
   }
 
   // -- Area loop: up to MAX_AREAS claims per machine --------------------------
+  const ALL_PROTOCOLS = ['h2', 'h1.1', 'h1.0'];
   let areasCompleted = 0;
   for (let areaNum = 1; areaNum <= MAX_AREAS; areaNum++) {
     resetAreaState();
@@ -341,50 +353,71 @@ async function fetchPage(loc, searchToken) {
     const mode = claim.identity_mode || 'fresh-lower';
     const flowName = FLOWS[claim.flow] ? claim.flow : 'A';
     const flow = FLOWS[flowName];
-    const ids = pickIds(mode, claim.identity);
     log(`area ${areaNum}/${MAX_AREAS}: id=${claim.noon_area_id} (${claim.area_name}, usually ${claim.usual_pages}p) delay=${delay}ms attempt=${claim.attempt}`);
-    log(`flow ${flowName} identity ${mode} device=${ids.deviceId}`);
 
-    const t0 = Date.now();
-    const pageMs = [];
-    const seen = new Set();
-    let setupMs = null, page = 0, stopReason = null;
-    const result = {};
-    try {
-      const mintZh = await mintToken(lat, lng, ids, flow);
-      const loc = flow.locate ? await locate(lat, lng) : { lat, lng, zh: mintZh, cookie: cookieStr(session.jar) };
-      await sleep(between(flow.list));
-      setupMs = Date.now() - t0;
-      let searchToken = null;
-      while (page < PAGE_CAP) {
-        page++;
-        const p0 = Date.now();
-        const r = await fetchPage(loc, searchToken);
-        pageMs.push(Date.now() - p0);
-        const fresh = r.outlets.filter((o) => !seen.has(o.outletCode));
-        for (const o of fresh) seen.add(o.outletCode);
-        if (r.outlets.length === 0) { stopReason = `empty@${page}`; break; }
-        if (fresh.length === 0)     { stopReason = `no-new@${page}`; break; }
-        if (!r.token)               { stopReason = `no-token@${page}`; break; }
-        searchToken = r.token;
-        if (Date.now() - t0 > TIME_CAP_MS) { stopReason = `time-cap@${page}`; break; }
-        await sleep(flow === FLOWS.A ? delay : between(flow.gap));
+    // -- Protocol cascade: in adaptive mode, try h2 → h1.1 → h1.0 per area ---
+    const protocols = ADAPTIVE_HTTP ? ALL_PROTOCOLS : [_httpLevel];
+    let result = {};
+
+    for (let pi = 0; pi < protocols.length; pi++) {
+      const proto = protocols[pi];
+      const isLast = pi === protocols.length - 1;
+      if (ADAPTIVE_HTTP) { _httpLevel = proto; _h11Agent = null; }
+      resetAreaState();
+
+      const ids = pickIds(mode, claim.identity);  // fresh identity per protocol attempt
+      log(`${ADAPTIVE_HTTP ? `[${proto}] ` : ''}flow ${flowName} identity ${mode} device=${ids.deviceId}`);
+
+      const t0 = Date.now();
+      const pageMs = [];
+      const seen = new Set();
+      let setupMs = null, page = 0, stopReason = null;
+      result = {};
+      try {
+        const mintZh = await mintToken(lat, lng, ids, flow);
+        const loc = flow.locate ? await locate(lat, lng) : { lat, lng, zh: mintZh, cookie: cookieStr(session.jar) };
+        await sleep(between(flow.list));
+        setupMs = Date.now() - t0;
+        let searchToken = null;
+        while (page < PAGE_CAP) {
+          page++;
+          const p0 = Date.now();
+          const r = await fetchPage(loc, searchToken);
+          pageMs.push(Date.now() - p0);
+          const fresh = r.outlets.filter((o) => !seen.has(o.outletCode));
+          for (const o of fresh) seen.add(o.outletCode);
+          if (r.outlets.length === 0) { stopReason = `empty@${page}`; break; }
+          if (fresh.length === 0)     { stopReason = `no-new@${page}`; break; }
+          if (!r.token)               { stopReason = `no-token@${page}`; break; }
+          searchToken = r.token;
+          if (Date.now() - t0 > TIME_CAP_MS) { stopReason = `time-cap@${page}`; break; }
+          await sleep(flow === FLOWS.A ? delay : between(flow.gap));
+        }
+        if (!stopReason) stopReason = `cap(${PAGE_CAP})`;
+        Object.assign(result, { outcome: 'ok', pages_done: page, stop_reason: stopReason });
+      } catch (e) {
+        const isBlocked = e.kind === 'blocked' || e.kind === 'rate_limited';
+        if (isBlocked && ADAPTIVE_HTTP && !isLast) {
+          log(`[${proto}] blocked at ${e.step} — downgrading to ${protocols[pi + 1]}...`);
+          await sleep(1000);
+          continue;  // try next protocol
+        }
+        Object.assign(result, {
+          outcome: e.kind || 'error', fail_step: e.step || 'other', http_status: e.status || null,
+          fail_page: e.step === 'search' ? page : null, pages_done: e.step === 'search' ? page - 1 : 0,
+          error: String(e.message).slice(0, 500),
+        });
       }
-      if (!stopReason) stopReason = `cap(${PAGE_CAP})`;
-      Object.assign(result, { outcome: 'ok', pages_done: page, stop_reason: stopReason });
-    } catch (e) {
       Object.assign(result, {
-        outcome: e.kind || 'error', fail_step: e.step || 'other', http_status: e.status || null,
-        fail_page: e.step === 'search' ? page : null, pages_done: e.step === 'search' ? page - 1 : 0,
-        error: String(e.message).slice(0, 500),
+        cards: seen.size, setup_ms: setupMs, elapsed_ms: Date.now() - t0, page_ms: pageMs,
+        token_age_ms: session ? Date.now() - session.mintedAt : null,
+        device_id: ids.deviceId, cookies: reqLog, block_info: blockInfo, flow: flowName, requests,
+        http_protocol: proto,
       });
+      break;  // either success or final failure — stop trying protocols
     }
-    Object.assign(result, {
-      cards: seen.size, setup_ms: setupMs, elapsed_ms: Date.now() - t0, page_ms: pageMs,
-      token_age_ms: session ? Date.now() - session.mintedAt : null,
-      device_id: ids.deviceId, cookies: reqLog, block_info: blockInfo, flow: flowName, requests,
-    });
-    log(`area ${areaNum} → ${result.outcome} ${result.fail_step || ''} pages=${result.pages_done} cards=${result.cards} ${result.elapsed_ms}ms`);
+
+    log(`area ${areaNum} → ${result.outcome} ${result.fail_step || ''} pages=${result.pages_done} cards=${result.cards} ${result.elapsed_ms}ms [${result.http_protocol}]`);
     await rpc('noon_lab_report', { p_test_id: TEST_ID, p_machine_no: MACHINE, p_item_id: itemId, p_result: result });
     areasCompleted++;
 
