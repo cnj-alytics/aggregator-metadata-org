@@ -705,9 +705,19 @@ function fireEtracker(session, step, events) {
       requests: reqLog.length,
     };
 
+    // keep_machine=true tells the Edge Function to leave the machine in
+    // 'working' status so it can claim the NEXT area. We pass true when more
+    // areas remain AND the session wasn't killed; the final report (last
+    // area or 403'd session) passes false so the machine is marked 'done'.
+    const willContinue = !sessionKilled && (areaIdx + 1 < MAX_AREAS);
     try {
-      const rep = await supa.report({ test_id: TEST_ID, machine_no: MACHINE, item_id, variant_id: variant_id || 'v2.10-multi', result });
-      say(`area ${areaIdx + 1} report ok (${rep.worker_version}) — outcome=${result.outcome} pages=${result.pages_done} cards=${result.cards} elapsed=${result.elapsed_ms}ms sessionKilled=${sessionKilled}`);
+      const rep = await supa.report({
+        test_id: TEST_ID, machine_no: MACHINE, item_id,
+        variant_id: variant_id || 'v2.10-multi',
+        result,
+        keep_machine: willContinue,
+      });
+      say(`area ${areaIdx + 1} report ok (${rep.worker_version}) — outcome=${result.outcome} pages=${result.pages_done} cards=${result.cards} elapsed=${result.elapsed_ms}ms keep_machine=${willContinue} sessionKilled=${sessionKilled}`);
     } catch (e) {
       say(`area ${areaIdx + 1} report FAILED: ${e.message}`);
       process.exitCode = 1;
