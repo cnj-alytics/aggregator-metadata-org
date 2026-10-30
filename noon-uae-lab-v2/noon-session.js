@@ -170,6 +170,10 @@ class Session {
     this.reqLog = [];
     this.blockInfo = null;
     this.searchPagesLogged = 0;
+    // Captured during mint from the food-home response body. The real app threads
+    // this token into the first /search POST — our page-1 body WITHOUT it was
+    // the pattern tell that Akamai was catching. Captured via captureInitialToken.
+    this.initialSearchToken = null;
   }
 
   async fetch(step, url, opts) {
@@ -205,6 +209,21 @@ class Session {
       sent_cookies: sentCookies, set,
     });
   }
+}
+
+// Attempt to read `searchToken` out of a successful JSON response and stash it on
+// the session. Called after the food-home calls that are known to carry it. Clones
+// the response so the main code path can still consume the body if needed.
+async function captureInitialToken(session, resp, label) {
+  try {
+    const clone = resp.clone();
+    const j = await clone.json();
+    const tok = j && typeof j === 'object' ? j.searchToken : null;
+    if (tok && typeof tok === 'string' && tok.length > 20) {
+      session.initialSearchToken = tok;
+      log(`captured initialSearchToken from ${label} (${tok.length} chars)`);
+    }
+  } catch (_) { /* body wasn't JSON or clone failed — ignore */ }
 }
 
 function errorChain(e) {
@@ -298,8 +317,10 @@ async function ecomWarmup(session, lat, lng, t) {
 async function foodTab(session, lat, lng, t) {
   await sleep(t.food_tab_gap || 1600);
   const H = () => headersFood(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.locale);
+  const foodHomeP = session.fetch('food_home', `${FD_BASE}/_svc/mp-food-api-catalog/api/`, { headers: H() });
+  foodHomeP.then((r) => captureInitialToken(session, r, 'food_home')).catch(() => {});
   await Promise.allSettled([
-    session.fetch('food_home',        `${FD_BASE}/_svc/mp-food-api-catalog/api/`,                           { headers: H() }),
+    foodHomeP,
     session.fetch('food_popups',      `${FD_BASE}/_svc/mp-food-api-catalog/api/popups`,                    { headers: H() }),
     session.fetch('food_whoami',      `${FD_BASE}/_svc/mp-food-api-catalog/api/customer/whoami`,           { headers: H() }),
     session.fetch('food_suggestions', `${FD_BASE}/_svc/mp-food-api-catalog/api/page/suggestions`,          { headers: H() }),
@@ -345,9 +366,13 @@ async function foodBrowse(session, lat, lng, t) {
   }).catch(() => {});
 
   await sleep(t.post_prefs_init || 3000);
+  const browseHome2P = session.fetch('browse_home2', `${FD_BASE}/_svc/mp-food-api-catalog/api/`, { headers: H() });
+  // Second capture overwrites the first — matches the real-trace behaviour where
+  // the token used on page 1 came from the phase-3 refresh, not the phase-2 call.
+  browseHome2P.then((r) => captureInitialToken(session, r, 'browse_home2')).catch(() => {});
   await Promise.allSettled([
     session.fetch('browse_light', `${FD_BASE}/_svc/mp-food-api-catalog/api/light/`, { headers: S() }),
-    session.fetch('browse_home2', `${FD_BASE}/_svc/mp-food-api-catalog/api/`,       { headers: H() }),
+    browseHome2P,
   ]);
   await sleep(t.post_light || 450);
   await Promise.allSettled([
@@ -401,7 +426,12 @@ async function paginate(session, lat, lng, spec) {
   const seen = new Set();
   const pageMs = [];
   const t0 = Date.now();
-  let searchToken = null;
+  // Start with the token captured during mint (matches real-app behaviour where
+  // page 1 carries a session searchToken, not an empty one). If capture failed,
+  // falls back to null — page 1 will go without a token, as before.
+  let searchToken = session.initialSearchToken || null;
+  if (searchToken) log(`page 1 using initialSearchToken (${searchToken.length} chars)`);
+  else             log('page 1 WITHOUT initialSearchToken (capture failed during mint)');
   let page = 0;
   let stopReason = null;
   let fail = null;
