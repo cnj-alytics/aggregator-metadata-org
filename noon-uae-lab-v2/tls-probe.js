@@ -15,7 +15,12 @@ const supa = require('./supabase.js');
 const TEST_ID = Number(process.env.TEST_ID);
 const MACHINE = Number(process.env.MACHINE_NO);
 const GH_RUN_ID = process.env.GITHUB_RUN_ID || '';
-const IMPERSONATE = process.env.IMPERSONATE || 'safari_ios_17_2';
+// Which curl-impersonate WRAPPER SCRIPT to use. These are shell wrappers around
+// curl-impersonate-chrome / -ff with the right --impersonate flag baked in.
+// v0.6.1 build includes: curl_safari15_3, curl_chrome99_android, curl_chrome{99-116},
+// curl_edge{99,101}, curl_ff{91esr,95-117}. No iOS preset in this build — the closest
+// Apple BoringSSL fingerprint is curl_safari15_3 (desktop Safari macOS).
+const CURL = process.env.IMPERSONATE_WRAPPER || 'curl_safari15_3';
 
 if (!TEST_ID || !MACHINE) {
   console.error('TEST_ID and MACHINE_NO are required');
@@ -25,10 +30,6 @@ if (!TEST_ID || !MACHINE) {
 const prefix = `[tls t${TEST_ID} m${MACHINE}]`;
 const say = (m) => console.log(`${prefix} ${m}`);
 
-// Which binary to use. curl-impersonate ships several wrappers; the iOS/Safari
-// family all go through curl-impersonate-chrome.
-const CURL = 'curl-impersonate-chrome';
-
 const UA = 'noon/22895 CFNetwork/3896.100.1.2.1 Darwin/27.0.0';
 const BUILD = '22895';
 
@@ -36,7 +37,7 @@ const BUILD = '22895';
 function egressIp() {
   try {
     const out = execFileSync(CURL, [
-      '--impersonate', IMPERSONATE, '-sS', '--max-time', '8',
+      '-sS', '--max-time', '8',
       'https://api.ipify.org',
     ], { encoding: 'utf-8', timeout: 10000 });
     return out.trim();
@@ -45,9 +46,9 @@ function egressIp() {
 
 // curl-impersonate call that returns {status, headers, body, setCookies}.
 // Uses -i to include headers in output, parses the HTTP response.
+// The wrapper (e.g. curl_safari15_3) already has --impersonate baked in.
 function curlCall(step, url, { method = 'GET', headers = {}, body = null, cookieJar = null } = {}) {
   const args = [
-    '--impersonate', IMPERSONATE,
     '-sS', '-i',
     '--max-time', '20',
     '-X', method,
@@ -114,7 +115,7 @@ function curlCall(step, url, { method = 'GET', headers = {}, body = null, cookie
 
 (async () => {
   const runnerIp = egressIp();
-  say(`egress ip ${runnerIp || '(unknown)'}, TLS impersonate=${IMPERSONATE}`);
+  say(`egress ip ${runnerIp || '(unknown)'}, TLS wrapper=${CURL}`);
 
   // Claim an area to probe
   const claim = await supa.claim({
