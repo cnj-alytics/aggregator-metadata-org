@@ -1,0 +1,59 @@
+name: Noon UAE – Lab TLS v2.10 (multi-area, up to 5 per machine)
+run-name: v2.10 test ${{ inputs.test_id }} m${{ inputs.machine_no }}
+
+# v2.10 — multi-area probe. Each machine scrapes up to MAX_AREAS areas
+# sequentially with the SAME visitor_id + device_id + cookie jar. First area
+# gets the full 4-call mint; subsequent areas get a set_location + dual
+# remint (treating it like a real user changing delivery address).
+# Loop ends at MAX_AREAS, on any 403, or when claim returns no more items.
+# Each area is reported as its own attempt row so per-area attrition is
+# measured independently.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_id:
+        description: 'noon_lab.test.test_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'noon_lab.machine.machine_no'
+        required: true
+        type: string
+
+concurrency:
+  group: noon-lab-v210-${{ inputs.test_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    name: v2.10 probe test ${{ inputs.test_id }} machine ${{ inputs.machine_no }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: noon-uae-lab-v2
+      - name: Install curl-impersonate
+        run: |
+          set -e
+          cd /tmp
+          curl -sSL -o ci.tar.gz "https://github.com/lwthiker/curl-impersonate/releases/download/v0.6.1/curl-impersonate-v0.6.1.x86_64-linux-gnu.tar.gz"
+          mkdir -p /opt/ci
+          tar -xzf ci.tar.gz -C /opt/ci
+          echo "/opt/ci" >> $GITHUB_PATH
+      - name: Install Node deps for reporter
+        working-directory: noon-uae-lab-v2
+        run: npm install --omit=dev --no-audit --no-fund
+      - name: v2.10 probe (multi-area)
+        working-directory: noon-uae-lab-v2
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TEST_ID: ${{ inputs.test_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          IMPERSONATE_WRAPPER: curl_safari15_3
+          REMINT_EVERY_PAGES: '3'
+          MAX_AREAS: '5'
+        run: node tls-probe-v210-multi.js
