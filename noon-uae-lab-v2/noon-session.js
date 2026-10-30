@@ -296,6 +296,7 @@ async function mint(session, lat, lng, spec) {
     if (phase === 'ecom_warmup') await ecomWarmup(session, lat, lng, t);
     else if (phase === 'food_tab') await foodTab(session, lat, lng, t);
     else if (phase === 'food_browse') await foodBrowse(session, lat, lng, t);
+    else if (phase === 'carousel_warmup') await carouselWarmup(session, lat, lng, t);
     else log(`unknown mint phase: ${phase}`);
   }
 
@@ -358,6 +359,27 @@ async function foodTab(session, lat, lng, t) {
     session.fetch('food_content', `${FD_BASE}/_svc/mp-food-api-catalog/api/search?content=noon_food_garnierkiwi&get_fallback=false`, { headers: S() }),
     session.fetch('food_reels',   `${FD_BASE}/_svc/mp-food-api-catalog/api/reels`, { headers: S() }),
   ]);
+}
+
+// carouselWarmup: the SMALLEST set of /search GETs the real app makes before its listing POST.
+// Pulled from the real-trace T+18.6 and T+27.4 bursts; drops the homepage/popups/whoami/favorites
+// chatter v2.1 was running. 4 benign /search GETs + reels — gives Akamai something to score as
+// legitimate /search traffic on this fingerprint before the big POST.
+async function carouselWarmup(session, lat, lng, t) {
+  await sleep(t.pre_carousel || 1000);
+  const S = () => headersSearch(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.whoHeaders, session.locale, session.minimalHeaders);
+  const foodHomeP = session.fetch('food_home', `${FD_BASE}/_svc/mp-food-api-catalog/api/`,
+    { headers: headersFood(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.locale, session.minimalHeaders) });
+  foodHomeP.then((r) => captureInitialToken(session, r, 'food_home')).catch(() => {});
+  await Promise.allSettled([
+    foodHomeP,
+    session.fetch('food_homepage_dyn',    `${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/dynamic`, { headers: S() }),
+    session.fetch('food_homepage_static', `${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/static`,  { headers: S() }),
+    session.fetch('food_carousel1', `${FD_BASE}/_svc/mp-food-api-catalog/api/search?queryEntity%5BentityType%5D=outlet_carousel_tab&queryEntity%5BentityCode%5D=recommended_new_user_carousel_tab&f%5Bserviceable%5D=1&withContent=False&limit=20&content=home&type=outlet`, { headers: S() }),
+    session.fetch('food_carousel2', `${FD_BASE}/_svc/mp-food-api-catalog/api/search?queryEntity%5BentityType%5D=outlet_carousel_tab&queryEntity%5BentityCode%5D=homepage_carousel_featured_tab&f%5Btags%5D=listing_ad&f%5Bserviceable%5D=1&withContent=False&limit=20&content=home&type=outlet`, { headers: S() }),
+    session.fetch('food_reels',     `${FD_BASE}/_svc/mp-food-api-catalog/api/reels`, { headers: S() }),
+  ]);
+  await sleep(t.post_carousel || 500);
 }
 
 async function foodBrowse(session, lat, lng, t) {
