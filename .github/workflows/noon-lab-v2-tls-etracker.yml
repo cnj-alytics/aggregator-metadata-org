@@ -1,0 +1,56 @@
+name: Noon UAE – Lab TLS + etracker probe (GitHub-hosted)
+run-name: v2.6 test ${{ inputs.test_id }} m${{ inputs.machine_no }} (TLS + etracker)
+
+# Builds on noon-lab-v2-tls-probe.yml. Same curl-impersonate TLS stack, same
+# lean 3-call mint. Added: 2 etracker.noon.com/track/v2 POSTs with
+# promotion_impression events after each /search page. Tests whether the
+# missing telemetry stream (observed as 69 etracker POSTs in a 60-second real
+# iPhone session, zero in ours) is what Akamai correlates against /search
+# pagination to score us as a bot.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_id:
+        description: 'noon_lab.test.test_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'noon_lab.machine.machine_no'
+        required: true
+        type: string
+
+concurrency:
+  group: noon-lab-v2-etracker-${{ inputs.test_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    name: v2.6 probe test ${{ inputs.test_id }} machine ${{ inputs.machine_no }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: noon-uae-lab-v2
+      - name: Install curl-impersonate
+        run: |
+          set -e
+          cd /tmp
+          curl -sSL -o ci.tar.gz "https://github.com/lwthiker/curl-impersonate/releases/download/v0.6.1/curl-impersonate-v0.6.1.x86_64-linux-gnu.tar.gz"
+          mkdir -p /opt/ci
+          tar -xzf ci.tar.gz -C /opt/ci
+          echo "/opt/ci" >> $GITHUB_PATH
+      - name: Install Node deps for reporter
+        working-directory: noon-uae-lab-v2
+        run: npm install --omit=dev --no-audit --no-fund
+      - name: TLS + etracker probe + report
+        working-directory: noon-uae-lab-v2
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TEST_ID: ${{ inputs.test_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          IMPERSONATE_WRAPPER: curl_safari15_3
+        run: node tls-probe-etracker.js
