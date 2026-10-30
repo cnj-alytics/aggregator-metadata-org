@@ -189,15 +189,40 @@ class Session {
   async fetch(step, url, opts) {
     const t0 = Date.now();
     this.requests++;
+    // Strip our own flags before handing opts to undici
+    const { retryOn403, ...fetchOpts } = opts || {};
     let resp;
     try {
-      resp = await doFetch(url, { ...opts, signal: AbortSignal.timeout(30000) });
+      resp = await doFetch(url, { ...fetchOpts, signal: AbortSignal.timeout(30000) });
     } catch (e) {
       const chain = errorChain(e);
       throw Object.assign(new Error(`${step} network: ${chain}`), { step, status: null, kind: 'error' });
     }
     this._logRequest(step, url, opts, resp, Date.now() - t0);
+    // Always merge set-cookies back into the jar — Akamai's _abck / ak_bmsc / bm_*
+    // cookies ROTATE per response and must be echoed back on the next request.
+    // (Previously only mint phase did this; warmup bursts and /search pages were
+    // discarding rotated cookies, which looks like bot replay to Akamai.)
+    try { mergeSetCookies(this.jar, resp); } catch (_) {}
     if (resp.status === 403 || resp.status === 429) {
+      // Akamai sometimes 403s AND sets a fresh _abck/ak_bmsc on the same response —
+      // real clients re-use those cookies and the next call succeeds (soft challenge).
+      // Give one retry on mint-level steps if we got a cookie refresh.
+      const retryable = retryOn403 && resp.headers.get('set-cookie');
+      if (retryable) {
+        log(`${step} 403 with set-cookie — retrying once after cookie refresh`);
+        await new Promise(r => setTimeout(r, 1200 + Math.random() * 800));
+        const retryHeaders = fetchOpts.headers && fetchOpts.headers.Cookie
+          ? { ...fetchOpts.headers, Cookie: cookieStr(this.jar) }
+          : fetchOpts.headers;
+        this.requests++;
+        try {
+          const r2 = await doFetch(url, { ...fetchOpts, headers: retryHeaders, signal: AbortSignal.timeout(30000) });
+          this._logRequest(step + '_retry', url, { headers: retryHeaders }, r2, Date.now() - t0);
+          try { mergeSetCookies(this.jar, r2); } catch (_) {}
+          if (r2.status >= 200 && r2.status < 400) return r2;
+        } catch (_) { /* fall through */ }
+      }
       this.blockInfo = await captureBlock(step, resp);
       const kind = resp.status === 403 ? 'blocked' : 'rate_limited';
       throw Object.assign(new Error(`${step} HTTP ${resp.status}`), { step, status: resp.status, kind });
@@ -261,7 +286,9 @@ async function mint(session, lat, lng, spec) {
   const firstUrl = session.firstExperience === 'food' ? WHOAMI_FOOD_URL : WHOAMI_URL;
   const r1 = await session.fetch('mint_whoami', firstUrl, {
     headers: headersFirstWhoami(session.deviceId, session.visitorId, session.minimalHeaders, session.firstExperience),
+    retryOn403: true,  // Akamai soft-challenge: retry once if 403 came with fresh _abck
   });
+  // session.fetch already merged cookies, but keep explicit merge for clarity.
   mergeSetCookies(session.jar, r1);
 
   // Splash / location-permission gap (real trace: 7.25s)
@@ -273,6 +300,7 @@ async function mint(session, lat, lng, spec) {
     headers: { ...headersEcom(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.locale, session.minimalHeaders),
                'Content-Type': 'application/json' },
     body: JSON.stringify({ location: { lat, lng }, lang: 'en' }),
+    retryOn403: true,
   });
   mergeSetCookies(session.jar, r2);
 
@@ -283,6 +311,7 @@ async function mint(session, lat, lng, spec) {
   const r3 = await session.fetch('mint_whoami_food', WHOAMI_FOOD_URL, {
     headers: { ...headersEcom(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.locale, session.minimalHeaders),
                'x-whoami-request-id': crypto.randomUUID() },
+    retryOn403: true,
   });
   const whoResp = await r3.json().catch(() => ({}));
   mergeSetCookies(session.jar, r3);
