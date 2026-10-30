@@ -55,36 +55,42 @@ function sentryTrace() {
   };
 }
 
-function baseHeaders(deviceId, visitorId) {
-  return {
+// Headers are built via session.* wrappers below so they can honour minimalHeaders.
+// The raw helpers take an explicit `minimal` flag; keep them for direct use.
+
+function baseHeaders(deviceId, visitorId, minimal = false) {
+  const h = {
     'User-Agent': UA,
     'x-platform': 'ios',
     'x-build': BUILD,
     'x-mp': 'noon',
     'x-content': 'mobile',
     Accept: 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
     'x-device-id': deviceId,
     'x-visitor-id': visitorId,
-    ...sentryTrace(),
   };
+  if (!minimal) {
+    h['Accept-Language'] = 'en-US,en;q=0.9';
+    h['Accept-Encoding'] = 'gzip, deflate, br';
+    h['Cache-Control'] = 'no-cache';
+    h['Connection'] = 'keep-alive';
+    Object.assign(h, sentryTrace());
+  }
+  return h;
 }
 
-function headersFirstWhoami(deviceId, visitorId) {
+function headersFirstWhoami(deviceId, visitorId, minimal = false, experience = 'ecom') {
   // Matches the real first call exactly: no x-locale, no device lat/lng, no cookies.
   return {
-    ...baseHeaders(deviceId, visitorId),
-    'x-experience': 'ecom',
+    ...baseHeaders(deviceId, visitorId, minimal),
+    'x-experience': experience,
     'x-whoami-request-id': crypto.randomUUID(),
   };
 }
 
-function headersEcom(deviceId, visitorId, lat, lng, cookie, locale = 'en-ae') {
+function headersEcom(deviceId, visitorId, lat, lng, cookie, locale = 'en-ae', minimal = false) {
   return {
-    ...baseHeaders(deviceId, visitorId),
+    ...baseHeaders(deviceId, visitorId, minimal),
     'x-experience': 'ecom',
     'x-locale': locale,
     'x-device-lat': String(lat),
@@ -93,9 +99,9 @@ function headersEcom(deviceId, visitorId, lat, lng, cookie, locale = 'en-ae') {
   };
 }
 
-function headersFood(deviceId, visitorId, lat, lng, cookie, locale = 'en-ae') {
+function headersFood(deviceId, visitorId, lat, lng, cookie, locale = 'en-ae', minimal = false) {
   return {
-    ...baseHeaders(deviceId, visitorId),
+    ...baseHeaders(deviceId, visitorId, minimal),
     'x-experience': 'food',
     'x-locale': locale,
     'x-device-lat': String(lat),
@@ -104,9 +110,9 @@ function headersFood(deviceId, visitorId, lat, lng, cookie, locale = 'en-ae') {
   };
 }
 
-function headersSearch(deviceId, visitorId, lat, lng, cookie, whoHeaders, locale = 'en-ae') {
+function headersSearch(deviceId, visitorId, lat, lng, cookie, whoHeaders, locale = 'en-ae', minimal = false) {
   const h = {
-    ...headersFood(deviceId, visitorId, lat, lng, cookie, locale),
+    ...headersFood(deviceId, visitorId, lat, lng, cookie, locale, minimal),
     'x-mp-country': 'ae',
     'x-lat': String(Math.round(lat * 1e7)),
     'x-lng': String(Math.round(lng * 1e7)),
@@ -114,7 +120,6 @@ function headersSearch(deviceId, visitorId, lat, lng, cookie, whoHeaders, locale
     'x-rocket-enabled': 'true',
     'Content-Type': 'application/json',
   };
-  // Overlay zone codes + ab-test from the whoami-food response
   for (const [k, v] of Object.entries(whoHeaders || {})) {
     if (v != null && typeof v !== 'object') h[k] = String(v);
   }
@@ -159,10 +164,18 @@ async function captureBlock(step, resp) {
 // ---------- Session object --------------------------------------------------
 // Holds the mutable state for ONE area: cookies, identity, timing, request log.
 class Session {
-  constructor({ deviceId, visitorId, locale = 'en-ae' }) {
+  constructor({ deviceId, visitorId, locale = 'en-ae',
+                minimalHeaders = false, firstExperience = 'ecom' }) {
     this.deviceId = deviceId;
     this.visitorId = visitorId;
     this.locale = locale;
+    // minimalHeaders=true drops sentry-trace, baggage, Accept-Language,
+    // Accept-Encoding, Cache-Control, Connection. Modeled on the production
+    // menu-read Edge Function, which runs clean against Noon at scale.
+    this.minimalHeaders = minimalHeaders;
+    // 'ecom' = first whoami hits ecom whoami URL (full-launch user journey).
+    // 'food' = first whoami hits food whoami URL (resumed-from-food-tab journey).
+    this.firstExperience = firstExperience;
     this.jar = {};
     this.whoHeaders = {};
     this.mintedAt = null;
@@ -170,9 +183,6 @@ class Session {
     this.reqLog = [];
     this.blockInfo = null;
     this.searchPagesLogged = 0;
-    // Captured during mint from the food-home response body. The real app threads
-    // this token into the first /search POST — our page-1 body WITHOUT it was
-    // the pattern tell that Akamai was catching. Captured via captureInitialToken.
     this.initialSearchToken = null;
   }
 
@@ -246,8 +256,11 @@ async function mint(session, lat, lng, spec) {
   const phases = spec.mint_phases || ['ecom_warmup', 'food_tab', 'food_browse'];
 
   // The first whoami is ALWAYS the first call (matches real trace T+0).
-  const r1 = await session.fetch('mint_whoami', WHOAMI_URL, {
-    headers: headersFirstWhoami(session.deviceId, session.visitorId),
+  // firstExperience='food' sends it to the food-whoami URL — simulates
+  // "user had food as last-selected experience and reopened the app".
+  const firstUrl = session.firstExperience === 'food' ? WHOAMI_FOOD_URL : WHOAMI_URL;
+  const r1 = await session.fetch('mint_whoami', firstUrl, {
+    headers: headersFirstWhoami(session.deviceId, session.visitorId, session.minimalHeaders, session.firstExperience),
   });
   mergeSetCookies(session.jar, r1);
 
@@ -257,16 +270,18 @@ async function mint(session, lat, lng, spec) {
   // set-location
   const r2 = await session.fetch('mint_set_location', SET_LOCATION_URL, {
     method: 'POST',
-    headers: { ...headersEcom(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.locale),
+    headers: { ...headersEcom(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.locale, session.minimalHeaders),
                'Content-Type': 'application/json' },
     body: JSON.stringify({ location: { lat, lng }, lang: 'en' }),
   });
   mergeSetCookies(session.jar, r2);
 
-  // whoami-food (gets nguestv2 token + ab-test headers)
+  // whoami-food (gets nguestv2 token + ab-test headers).
+  // If we already called food-whoami as the FIRST call (firstExperience='food'),
+  // this second call still runs so we re-pull zone headers after set-location.
   await sleep(t.post_whoami_food || 500);
   const r3 = await session.fetch('mint_whoami_food', WHOAMI_FOOD_URL, {
-    headers: { ...headersEcom(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.locale),
+    headers: { ...headersEcom(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.locale, session.minimalHeaders),
                'x-whoami-request-id': crypto.randomUUID() },
   });
   const whoResp = await r3.json().catch(() => ({}));
@@ -289,7 +304,7 @@ async function mint(session, lat, lng, spec) {
 }
 
 async function ecomWarmup(session, lat, lng, t) {
-  const H = () => headersEcom(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.locale);
+  const H = () => headersEcom(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.locale, session.minimalHeaders);
 
   await sleep(t.post_warmup1 || 300);
   await Promise.allSettled([
@@ -316,7 +331,7 @@ async function ecomWarmup(session, lat, lng, t) {
 
 async function foodTab(session, lat, lng, t) {
   await sleep(t.food_tab_gap || 1600);
-  const H = () => headersFood(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.locale);
+  const H = () => headersFood(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.locale, session.minimalHeaders);
   const foodHomeP = session.fetch('food_home', `${FD_BASE}/_svc/mp-food-api-catalog/api/`, { headers: H() });
   foodHomeP.then((r) => captureInitialToken(session, r, 'food_home')).catch(() => {});
   await Promise.allSettled([
@@ -329,7 +344,7 @@ async function foodTab(session, lat, lng, t) {
   ]);
 
   await sleep(t.post_food_burst || 900);
-  const S = () => headersSearch(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.whoHeaders, session.locale);
+  const S = () => headersSearch(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.whoHeaders, session.locale, session.minimalHeaders);
   await Promise.allSettled([
     session.fetch('food_homepage_dyn',    `${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/dynamic`, { headers: S() }),
     session.fetch('food_homepage_static', `${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/static`,  { headers: S() }),
@@ -347,11 +362,11 @@ async function foodTab(session, lat, lng, t) {
 
 async function foodBrowse(session, lat, lng, t) {
   await sleep(t.pre_browse || 1200);
-  const H = () => headersFood(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.locale);
-  const S = () => headersSearch(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.whoHeaders, session.locale);
+  const H = () => headersFood(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.locale, session.minimalHeaders);
+  const S = () => headersSearch(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.whoHeaders, session.locale, session.minimalHeaders);
 
   await Promise.allSettled([
-    session.fetch('browse_whoami',      WHOAMI_URL, { headers: { ...baseHeaders(session.deviceId, session.visitorId), 'x-experience': 'ecom', Cookie: cookieStr(session.jar) } }),
+    session.fetch('browse_whoami',      WHOAMI_URL, { headers: { ...baseHeaders(session.deviceId, session.visitorId, session.minimalHeaders), 'x-experience': 'ecom', Cookie: cookieStr(session.jar) } }),
     session.fetch('browse_food_whoami', `${FD_BASE}/_svc/mp-food-api-catalog/api/customer/whoami`, { headers: H() }),
     session.fetch('browse_hp_dyn',      `${FD_BASE}/_svc/mp-food-api-mpnoon/order/homepage/dynamic`, { headers: S() }),
   ]);
@@ -400,7 +415,7 @@ async function fetchPage(session, lat, lng, searchToken, bodyOverrides) {
 
   const resp = await session.fetch('search', SEARCH_URL, {
     method: 'POST',
-    headers: headersSearch(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.whoHeaders, session.locale),
+    headers: headersSearch(session.deviceId, session.visitorId, lat, lng, cookieStr(session.jar), session.whoHeaders, session.locale, session.minimalHeaders),
     body: JSON.stringify(body),
   });
   if (resp.status === 404) return { outlets: [], token: null };

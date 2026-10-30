@@ -61,6 +61,11 @@ const say = (m) => console.log(`${prefix} ${m}`);
     deviceId: identity.device_id,
     visitorId: identity.visitor_id,
     locale: spec.locale,
+    // v2.2 opts into minimalHeaders to strip sentry/baggage/accept-* etc —
+    // matches menu-read's production shape. v2.1 leaves it off (default false).
+    minimalHeaders: spec.minimal_headers === true,
+    // v2.3 opts firstExperience='food' to simulate "resumed-from-food-tab".
+    firstExperience: spec.first_experience === 'food' ? 'food' : 'ecom',
   });
 
   const t0 = Date.now();
