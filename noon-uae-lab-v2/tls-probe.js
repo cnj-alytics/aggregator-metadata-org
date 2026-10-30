@@ -1,10 +1,17 @@
 #!/usr/bin/env node
-// TLS probe: do the real Noon flow but through curl-impersonate so the TLS
-// handshake looks like iOS Safari 17.2 (same stack as the Noon app itself).
-// Everything else (HTTP headers, request bodies, order, timing) matches v2.1.
+// v2.7 TLS + full-telemetry probe. Upgrades v2.6 in two ways:
 //
-// Writes the result through the same noon-lab-claim/noon-lab-report Edge
-// Functions as the main worker — so the attempt row lands in the usual place.
+// (A) Mint-phase etracker events — real app fires launch, launch_info,
+//     app_foreground, location_fetch, whoami_ab_config, selected_zone, page_home
+//     BEFORE first /search. We now fire these during mint so our visitor_id
+//     looks like a session that opened the app, not one that teleports into
+//     /search cold.
+//
+// (B) Three impression types per outlet during pagination — the real app sends
+//     outlet_impression + outlet_impression_v2 + promotion_impression paired
+//     for every card. v2.6 only sent promotion_impression. v2.7 sends all three.
+//
+// Schemas copied from the Oct 28 iPhone Proxyman trace.
 
 'use strict';
 
@@ -113,9 +120,189 @@ function curlCall(step, url, { method = 'GET', headers = {}, body = null, cookie
   return { step, status, ms, headers: headersMap, setCookies, body: bodyText };
 }
 
+// =========================================================================
+// etracker helpers — matching event schemas from the real iPhone Proxyman trace
+// =========================================================================
+const ETRACKER_URL = 'https://etracker.noon.com/track/v2/';
+
+// Standard device block that every event carries
+function deviceBlock(idfv) {
+  return {
+    dm: 'Apple iPhone 17 Pro Max',
+    dos: 'ios 27.0.1',
+    d: 'Handset',
+    sr: '1320x2868',
+    vps: '1320x2868',
+    scl: 3,
+    idfa: '00000000-0000-0000-0000-000000000000',
+    idfv: idfv,
+  };
+}
+
+// Build a single event with the top-level envelope the real app uses
+function evt(ev, em, visitorId, idfv) {
+  return {
+    em,
+    ev,
+    ts: Date.now(),
+    pc: 'noon',
+    vid: visitorId,
+    lo: 'en-ae',
+    pf: 'ios',
+    d: deviceBlock(idfv),
+  };
+}
+
+// --- mint-phase events (fired BEFORE first /search) ---
+function evLaunch(visitorId, idfv) {
+  return evt('launch', {
+    fsv: '1.00',
+    isNA: false,
+    nps: 'denied',
+    perf: { NTJS: { d: 700 }, GWA: { d: 250 }, SR: { d: 280, m: { fsmps: 10 } }, TJS: { d: 15500 }, TAS: { d: 16200 } },
+    mc: 'noon', an: 'noon', av: '5.261024', ab: '22895', mpe: 'noon',
+  }, visitorId, idfv);
+}
+function evLaunchInfo(visitorId, idfv) {
+  const now = Date.now();
+  return evt('launch_info', {
+    nsa: now - 10000, jsa: now - 9400, ds: 0.6, s: 'app_launch', dl: 'en',
+    mc: 'noon', an: 'noon', av: '5.261024', ab: '22895', mpe: 'noon',
+  }, visitorId, idfv);
+}
+function evAppForeground(visitorId, idfv) {
+  return evt('app_foreground', {
+    mc: 'food', an: 'noon', av: '5.261024', ab: '22895', mpe: 'food',
+  }, visitorId, idfv);
+}
+function evLocationFetch(visitorId, idfv) {
+  return evt('location_fetch', {
+    GPS_allow: true,
+    mc: 'noon', an: 'noon', av: '5.261024', ab: '22895', mpe: 'noon',
+  }, visitorId, idfv);
+}
+function evPageHome(visitorId, idfv) {
+  return evt('page_home', {
+    curl: '/',
+    mc: 'noon', an: 'noon', av: '5.261024', ab: '22895', mpe: 'noon',
+  }, visitorId, idfv);
+}
+function evSelectedZone(zh, visitorId, idfv) {
+  // zh is the headers object from whoami-food response (zone codes)
+  return evt('selected_zone', {
+    szn: String(zh['x-ecom-zonecode'] || 'AE_DXB-S1'),
+    szf: String(zh['x-food-zonecode'] || 'FOOD-AE-DXB-HUB4-DUBAI_MARINA'),
+    szi: String(zh['x-nooninstant-zonecode'] || ''),
+    szr: String(zh['x-rocket-zonecode'] || ''),
+    sznow: String(zh['x-noonnownow-zonecode'] || ''),
+    szs: String(zh['x-services-zonecode'] || 'SERVICES-AE-DUBAI'),
+    szmpr: String(zh['x-rocket-mp-zonecode'] || ''),
+    szg: String(zh['x-ecom-zonecode'] || 'AE_DXB-S1'),
+    address_codes: [{mp:'ecom'},{mp:'rocket'},{mp:'food'},{mp:'nooninstant'},{mp:'services'},{mp:'noonnownow'},{mp:'ping'},{mp:'out'},{mp:'aster'},{mp:'money'}],
+    mc: 'food', an: 'noon', av: '5.261024', ab: '22895', mpe: 'food',
+  }, visitorId, idfv);
+}
+function evWhoamiAbConfig(zh, visitorId, idfv) {
+  // Pull real x-ab-test ids from whoami-food response if available
+  let abIds = [];
+  const raw = zh['x-ab-test'];
+  if (typeof raw === 'string') abIds = raw.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+  else if (Array.isArray(raw)) abIds = raw.filter(n => typeof n === 'number');
+  return evt('whoami_ab_config', {
+    abIds: abIds.length ? abIds : [1052, 1471, 1531, 1731, 1750],
+    mc: 'noon', an: 'noon', av: '5.261024', ab: '22895', mpe: 'noon',
+  }, visitorId, idfv);
+}
+function evPageCatalog(pageNum, visitorId, idfv) {
+  return evt('page_catalog', {
+    hid: crypto.randomUUID(),
+    nbh: 60, pn: pageNum, sb: 'browse',
+    mc: 'food', an: 'noon', av: '5.261024', ab: '22895', mpe: 'food',
+  }, visitorId, idfv);
+}
+
+// --- card-impression triplets fired during /search pagination ---
+// For each outlet in viewport, real app sends outlet_impression +
+// outlet_impression_v2 + promotion_impression PAIRED (same timestamp).
+function evOutletImpression(outlet, idx, visitorId, idfv) {
+  return evt('outlet_impression', {
+    oc: outlet.outletCode,
+    wid: `search_outlet/${idx}`,
+    aid: outlet.outletCode,
+    ix: `0/${idx}`,
+    otg: false,
+    df: outlet.distance || 5.0,
+    fav: false,
+    isp: true,
+    sla: outlet.sla || '30-40',
+    wn: 'search_results',
+    wtc: 'search_results_tab',
+    curl: '/search?type=outlet',
+    src: 'search/results',
+    pn: 'Search_Results',
+    mc: 'food', an: 'noon', av: '5.261024', ab: '22895', mpe: 'food',
+  }, visitorId, idfv);
+}
+function evOutletImpressionV2(outlet, idx, visitorId, idfv) {
+  return evt('outlet_impression_v2', {
+    pg: 'SR',
+    wt: `SR/search_results/0/search_results_tab/${idx}/ROW/${idx}/ITM/0`,
+    ul: '/search?type=outlet',
+    cf: '{}',
+    isp: true,
+    oc: outlet.outletCode,
+    df: outlet.distance || 5.0,
+    sla: outlet.sla || '30-40',
+    mc: 'food', an: 'noon', av: '5.261024', ab: '22895', mpe: 'food',
+  }, visitorId, idfv);
+}
+function evPromotionImpression(outlet, idx, visitorId, idfv) {
+  return evt('promotion_impression', {
+    aid: outlet.outletCode,
+    wid: `search_results/${idx}`,
+    aidMap: { [outlet.outletCode]: `search_results/${idx}` },
+    ismMap: { [outlet.outletCode]: true },
+    curl: '/search?type=outlet',
+    toUrl: `/outlet/${outlet.outletCode}`,
+    ed: { eIds: [], reqId: crypto.randomUUID() },
+    cmsEids: {},
+    wp: idx,
+    ar: 100,
+    adType: 'display',
+    isAd: false,
+    mc: 'food', an: 'noon', av: '5.261024', ab: '22895', mpe: 'food',
+  }, visitorId, idfv);
+}
+
+// Build an etracker batch of 3-event triplets (outlet_impression,
+// outlet_impression_v2, promotion_impression) for a slice of outlets.
+function impressionTripletsBatch(outlets, startIdx, visitorId, idfv) {
+  const events = [];
+  outlets.forEach((o, i) => {
+    const idx = startIdx + i;
+    events.push(evOutletImpression(o, idx, visitorId, idfv));
+    events.push(evOutletImpressionV2(o, idx, visitorId, idfv));
+    events.push(evPromotionImpression(o, idx, visitorId, idfv));
+  });
+  return events;
+}
+
+// Shared helper: fire an etracker POST and log it
+function fireEtracker(session, step, events) {
+  return curlCall(step, ETRACKER_URL, {
+    method: 'POST',
+    headers: {
+      ...session.base(),
+      'Content-Type': 'text/plain;charset=UTF-8',
+    },
+    body: JSON.stringify(events),
+    cookieJar: session.jar,
+  });
+}
+
 (async () => {
   const runnerIp = egressIp();
-  say(`egress ip ${runnerIp || '(unknown)'}, TLS wrapper=${CURL}`);
+  say(`egress ip ${runnerIp || '(unknown)'}, TLS wrapper=${CURL} (v2.7 + full telemetry)`);
 
   // Claim an area to probe
   const claim = await supa.claim({
@@ -162,6 +349,13 @@ function curlCall(step, url, { method = 'GET', headers = {}, body = null, cookie
   let whoHeaders = {};
   const seen = new Set();
 
+  // deviceIdfv (uppercase UUID) used in every etracker event's d.idfv
+  const deviceIdfv = (deviceId.includes('-') ? deviceId.toUpperCase() : crypto.randomUUID().toUpperCase());
+
+  // helper for firing etracker (needs access to base/jar/visitorId/deviceIdfv)
+  const sessionCtx = { base, jar };
+  const et = (step, events) => fireEtracker(sessionCtx, step, events);
+
   try {
     // 1. whoami ecom
     let r = curlCall('mint_whoami', 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami', {
@@ -172,8 +366,18 @@ function curlCall(step, url, { method = 'GET', headers = {}, body = null, cookie
     say(`mint_whoami: ${r.status} in ${r.ms}ms, cookies set: ${(r.setCookies || []).length}`);
     if (r.status !== 200) throw Object.assign(new Error(`mint_whoami ${r.status}`), { step: 'mint_whoami', status: r.status, kind: r.status === 403 ? 'blocked' : 'error' });
 
+    // --- v2.7 mint-phase telemetry: launch sequence ---
+    await new Promise(res => setTimeout(res, 300 + Math.random() * 300));
+    let etr = et('et_mint_launch', [
+      evLaunch(visitorId, deviceIdfv),
+      evLaunchInfo(visitorId, deviceIdfv),
+      evAppForeground(visitorId, deviceIdfv),
+    ]);
+    reqLog.push({ step: 'et_mint_launch', status: etr.status, ms: etr.ms });
+    say(`et_mint_launch: ${etr.status} in ${etr.ms}ms`);
+
     // 2. set-location
-    await new Promise(res => setTimeout(res, 1500 + Math.random() * 1000));
+    await new Promise(res => setTimeout(res, 1200 + Math.random() * 800));
     r = curlCall('mint_set_location', 'https://api-app.noon.com/_vs/st/mp-identity-api-geo/serviceable-geo-info/set-location-by-lat-lng', {
       method: 'POST',
       headers: {
@@ -187,6 +391,15 @@ function curlCall(step, url, { method = 'GET', headers = {}, body = null, cookie
     reqLog.push({ step: r.step, status: r.status, ms: r.ms, set_count: (r.setCookies || []).length });
     say(`mint_set_location: ${r.status} in ${r.ms}ms, cookies set: ${(r.setCookies || []).length}`);
     if (r.status !== 200) throw Object.assign(new Error(`mint_set_location ${r.status}`), { step: 'mint_set_location', status: r.status, kind: r.status === 403 ? 'blocked' : 'error' });
+
+    // --- v2.7 mint-phase telemetry: location + home-page view ---
+    await new Promise(res => setTimeout(res, 200 + Math.random() * 300));
+    etr = et('et_mint_location', [
+      evLocationFetch(visitorId, deviceIdfv),
+      evPageHome(visitorId, deviceIdfv),
+    ]);
+    reqLog.push({ step: 'et_mint_location', status: etr.status, ms: etr.ms });
+    say(`et_mint_location: ${etr.status} in ${etr.ms}ms`);
 
     // 3. whoami food
     await new Promise(res => setTimeout(res, 400 + Math.random() * 300));
@@ -206,6 +419,16 @@ function curlCall(step, url, { method = 'GET', headers = {}, body = null, cookie
       whoHeaders = (whoResp && whoResp.headers && typeof whoResp.headers === 'object') ? whoResp.headers : {};
     } catch (_) {}
     if (!jar.nguestv2) throw Object.assign(new Error('no nguestv2'), { step: 'mint_whoami_food', status: null, kind: 'error' });
+
+    // --- v2.7 mint-phase telemetry: zone selection + ab config (uses whoami-food response) ---
+    await new Promise(res => setTimeout(res, 150 + Math.random() * 250));
+    etr = et('et_mint_zone', [
+      evWhoamiAbConfig(whoHeaders, visitorId, deviceIdfv),
+      evSelectedZone(whoHeaders, visitorId, deviceIdfv),
+    ]);
+    reqLog.push({ step: 'et_mint_zone', status: etr.status, ms: etr.ms });
+    say(`et_mint_zone: ${etr.status} in ${etr.ms}ms`);
+
     setupMs = Date.now() - setupStart;
     say(`mint complete in ${setupMs}ms — attempting /search pagination`);
 
@@ -260,6 +483,30 @@ function curlCall(step, url, { method = 'GET', headers = {}, body = null, cookie
       cards = seen.size;
       if (outlets.length === 0 || fresh.length === 0 || !json.searchToken) break;
       searchToken = json.searchToken;
+
+      // --- v2.7: fire catalog-page view + full impression triplets ---
+      // Real app per card: outlet_impression + outlet_impression_v2 +
+      // promotion_impression (all three, same timestamp). We send 3 batches
+      // of 20 outlets each (60 outlets × 3 events = 180 events total,
+      // distributed across the scroll time).
+      if (outlets.length > 0) {
+        // Catalog page view event (user is on /search/results screen)
+        await new Promise(res => setTimeout(res, 150 + Math.random() * 200));
+        let etc = et('et_page_catalog', [evPageCatalog(pagesDone, visitorId, deviceIdfv)]);
+        reqLog.push({ step: 'et_page_catalog', status: etc.status, ms: etc.ms });
+
+        // 3 batches of 20 outlets each
+        const slices = [outlets.slice(0, 20), outlets.slice(20, 40), outlets.slice(40, 60)];
+        for (let b = 0; b < slices.length; b++) {
+          const slice = slices[b];
+          if (slice.length === 0) continue;
+          await new Promise(res => setTimeout(res, 500 + Math.random() * 900));
+          const events = impressionTripletsBatch(slice, b * 20, visitorId, deviceIdfv);
+          const batchResp = et(`et_impressions_b${b+1}`, events);
+          reqLog.push({ step: `et_impressions_b${b+1}`, status: batchResp.status, ms: batchResp.ms, event_count: events.length });
+        }
+        say(`page ${pagesDone} telemetry: catalog + 3 impression triplet batches`);
+      }
     }
   } catch (e) {
     fail = e;
@@ -284,7 +531,7 @@ function curlCall(step, url, { method = 'GET', headers = {}, body = null, cookie
   };
 
   try {
-    const r = await supa.report({ test_id: TEST_ID, machine_no: MACHINE, item_id, variant_id: variant_id || 'v2.5-tls-ios', result });
+    const r = await supa.report({ test_id: TEST_ID, machine_no: MACHINE, item_id, variant_id: variant_id || 'v2.7-full-telemetry', result });
     say(`report ok (${r.worker_version})`);
   } catch (e) {
     say(`report FAILED: ${e.message}`);
@@ -295,7 +542,7 @@ function curlCall(step, url, { method = 'GET', headers = {}, body = null, cookie
   console.error(`${prefix} fatal: ${e.message}`);
   try {
     await supa.report({
-      test_id: TEST_ID, machine_no: MACHINE, item_id: null, variant_id: 'v2.5-tls-ios',
+      test_id: TEST_ID, machine_no: MACHINE, item_id: null, variant_id: 'v2.7-full-telemetry',
       result: { outcome: 'error', error: e.message },
     });
   } catch (_) {}
