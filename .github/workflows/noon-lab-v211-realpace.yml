@@ -1,0 +1,58 @@
+name: Noon UAE – Lab TLS v2.11 (real-pace, no remints)
+run-name: v2.11 test ${{ inputs.test_id }} m${{ inputs.machine_no }}
+
+# v2.11 — matches the Oct 31 deep-scroll Proxyman trace behavior:
+#  - Inter-page gap 5.5-7.8s (uniform jitter), mean ~6.1s. Previous versions
+#    used ~1-3s per page which was 2-5x too fast.
+#  - ZERO mid-pagination remints. The real app made 0 whoami calls across
+#    150s of scrolling 21 pages. We mimic exactly.
+#  - 4-call mint and full etracker telemetry preserved from v2.9.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_id:
+        description: 'noon_lab.test.test_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'noon_lab.machine.machine_no'
+        required: true
+        type: string
+
+concurrency:
+  group: noon-lab-v211-${{ inputs.test_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    name: v2.11 probe test ${{ inputs.test_id }} machine ${{ inputs.machine_no }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: noon-uae-lab-v2
+      - name: Install curl-impersonate
+        run: |
+          set -e
+          cd /tmp
+          curl -sSL -o ci.tar.gz "https://github.com/lwthiker/curl-impersonate/releases/download/v0.6.1/curl-impersonate-v0.6.1.x86_64-linux-gnu.tar.gz"
+          mkdir -p /opt/ci
+          tar -xzf ci.tar.gz -C /opt/ci
+          echo "/opt/ci" >> $GITHUB_PATH
+      - name: Install Node deps for reporter
+        working-directory: noon-uae-lab-v2
+        run: npm install --omit=dev --no-audit --no-fund
+      - name: v2.11 probe (real-pace, no remints)
+        working-directory: noon-uae-lab-v2
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TEST_ID: ${{ inputs.test_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          IMPERSONATE_WRAPPER: curl_safari15_3
+          PAGE_GAP_MS_MIN: '5500'
+          PAGE_GAP_MS_MAX: '7800'
+        run: node tls-probe-v211-realpace.js
