@@ -1,0 +1,58 @@
+name: Noon UAE – Lab TLS v2.8 (periodic remint)
+run-name: v2.8 test ${{ inputs.test_id }} m${{ inputs.machine_no }}
+
+# v2.8 adds:
+#  - Fourth mint call: api-app-fd.noon.com/_svc/mp-food-api-catalog/api/customer/whoami
+#    (the real app always hits this after the api-app-st pair, v2.7 missed it)
+#  - Dual remint every REMINT_EVERY_PAGES (default 3) during /search pagination,
+#    mirroring the real-app cadence seen in Proxyman (whoami every 8-12s on both
+#    api-app-st and api-app-fd together).
+#  - zone/ab etracker refresh after each remint.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_id:
+        description: 'noon_lab.test.test_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'noon_lab.machine.machine_no'
+        required: true
+        type: string
+
+concurrency:
+  group: noon-lab-v28-${{ inputs.test_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    name: v2.8 probe test ${{ inputs.test_id }} machine ${{ inputs.machine_no }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: noon-uae-lab-v2
+      - name: Install curl-impersonate
+        run: |
+          set -e
+          cd /tmp
+          curl -sSL -o ci.tar.gz "https://github.com/lwthiker/curl-impersonate/releases/download/v0.6.1/curl-impersonate-v0.6.1.x86_64-linux-gnu.tar.gz"
+          mkdir -p /opt/ci
+          tar -xzf ci.tar.gz -C /opt/ci
+          echo "/opt/ci" >> $GITHUB_PATH
+      - name: Install Node deps for reporter
+        working-directory: noon-uae-lab-v2
+        run: npm install --omit=dev --no-audit --no-fund
+      - name: v2.8 probe (periodic remint)
+        working-directory: noon-uae-lab-v2
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TEST_ID: ${{ inputs.test_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          IMPERSONATE_WRAPPER: curl_safari15_3
+          REMINT_EVERY_PAGES: '3'
+        run: node tls-probe-v28.js
