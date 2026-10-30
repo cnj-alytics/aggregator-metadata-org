@@ -1,0 +1,59 @@
+name: Noon UAE – Lab TLS Probe (curl-impersonate iOS, GitHub-hosted)
+run-name: TLS probe test ${{ inputs.test_id }} m${{ inputs.machine_no }} (iOS JA3)
+
+# Isolates ONE variable from v2.1: the TLS fingerprint.
+# Same host (US Azure GitHub-hosted ubuntu-latest). Same HTTP headers.
+# Replaces the TLS stack with curl-impersonate's safari_ios_17_2 preset so the
+# handshake Akamai sees matches a real iPhone. All results reported via the normal
+# noon-lab-report Edge Function.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_id:
+        description: 'noon_lab.test.test_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'noon_lab.machine.machine_no'
+        required: true
+        type: string
+
+concurrency:
+  group: noon-lab-v2-tls-${{ inputs.test_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    name: TLS probe test ${{ inputs.test_id }} machine ${{ inputs.machine_no }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: noon-uae-lab-v2
+      - name: Install curl-impersonate
+        run: |
+          set -e
+          cd /tmp
+          # lwthiker/curl-impersonate v0.6.1 — includes safari_ios_17_2 preset
+          curl -sSL -o ci.tar.gz "https://github.com/lwthiker/curl-impersonate/releases/download/v0.6.1/curl-impersonate-v0.6.1.x86_64-linux-gnu.tar.gz"
+          mkdir -p /opt/ci
+          tar -xzf ci.tar.gz -C /opt/ci
+          echo "/opt/ci" >> $GITHUB_PATH
+          ls /opt/ci | head -20
+          /opt/ci/curl-impersonate-chrome --version | head -3 || true
+      - name: Install Node deps for reporter
+        working-directory: noon-uae-lab-v2
+        run: npm install --omit=dev --no-audit --no-fund
+      - name: TLS probe + report
+        working-directory: noon-uae-lab-v2
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TEST_ID: ${{ inputs.test_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          # Which curl-impersonate wrapper to use. Default = iOS Safari 17.2.
+          IMPERSONATE: safari_ios_17_2
+        run: node tls-probe.js
