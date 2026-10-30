@@ -1,9 +1,10 @@
-name: Noon UAE – Lab Ranking v2 (started by Supabase)
-run-name: Noon lab v2 test ${{ inputs.test_id }} m${{ inputs.machine_no }}
+name: Noon UAE – Lab Ranking v2 (Ubicloud EU, started by Supabase)
+run-name: Noon lab v2 test ${{ inputs.test_id }} m${{ inputs.machine_no }} (Ubicloud)
 
-# v2 worker. One machine = one area attempt. Variant spec is served by the
-# noon-lab-claim Edge Function in Supabase; the worker is a dumb executor.
-# Started by Supabase dispatch; stopped by test deadline or claim returning stop.
+# Same as noon-lab-v2-worker.yml but runs on Ubicloud (EU IP range, no proxy).
+# Isolates IP origin as a variable: if v2.1 on Ubicloud performs noticeably
+# differently from v2.1 on GitHub-hosted Azure IPs, Akamai's peak-hour hammer
+# is targeting US datacenter IPs specifically rather than all datacenter IPs.
 
 on:
   workflow_dispatch:
@@ -23,9 +24,9 @@ concurrency:
 
 jobs:
   worker:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     timeout-minutes: 15
-    name: v2 test ${{ inputs.test_id }} machine ${{ inputs.machine_no }}
+    name: v2 test ${{ inputs.test_id }} machine ${{ inputs.machine_no }} (Ubicloud)
     steps:
       - uses: actions/checkout@v4
         with:
