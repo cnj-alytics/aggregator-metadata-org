@@ -1,0 +1,79 @@
+name: Noon UAE – Ranking scrape (ORG)
+
+# ORG-side runner. One dispatch = one machine = one GitHub-runner IP.
+# This workflow runs the merged scraper from the local checkout (noon/uae/
+# ranking-scrape.js). The PERSONAL repo's workflow of the same name checks
+# out THIS repo via a PAT and runs the same file — single source of truth.
+#
+# Dispatched by Supabase function noon_ranking_dispatch_machine; both the
+# ORG and the PERSONAL dispatch targets drain the same shared queue, so the
+# worker code must behave identically in both places.
+
+run-name: ranking run ${{ inputs.run_id }} m${{ inputs.machine_no }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'noon_ranking_run.id'
+        required: true
+        type: string
+      machine_no:
+        description: 'machine_no inside the run'
+        required: true
+        type: string
+      page_delay_ms:
+        description: 'overrides the per-page sleep (ms)'
+        required: false
+        type: string
+      pin_area_id:
+        description: 'optional: force this machine to only pick this area'
+        required: false
+        type: string
+
+# Each (run, machine) pair gets its own concurrency group so re-dispatches
+# with the same inputs don't double-fire. Noon's rules: fresh IP per
+# machine, max 2 areas per machine, 55-min production deadline above.
+concurrency:
+  group: noon-uae-ranking-${{ inputs.run_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    # 70-minute hard ceiling. Production's 55-minute deadline (enforced by
+    # Supabase) will have already stopped new dispatches by then; this is
+    # the safety net for an in-flight machine, not the primary timer.
+    timeout-minutes: 70
+    name: scrape run ${{ inputs.run_id }} machine ${{ inputs.machine_no }}
+    steps:
+      - name: Checkout org repo (single source of truth)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: noon/uae
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Ranking scrape
+        working-directory: noon/uae
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_ID: ${{ inputs.run_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          # Wall-clock safety: 70-min job minus a buffer for cleanup.
+          WALL_LIMIT_SEC: '4000'
+          # v3 resilience knobs. These are safe defaults; the server-side
+          # noon_ranking_claim RPC can still override per-area pacing via
+          # the page_delay_ms it returns.
+          RECOVERY_ATTEMPTS: '3'
+          TOKEN_REFRESH_AT_MS: '240000'
+          RECOVERY_BACKOFF_MS: '1500'
+          # Optional overrides from the dispatch inputs.
+          OVERRIDE_PAGE_DELAY_MS: ${{ inputs.page_delay_ms }}
+          OVERRIDE_PIN_AREA_ID: ${{ inputs.pin_area_id }}
+        run: node ranking-scrape.js
