@@ -303,6 +303,22 @@ async function rpc(name, params) {
 let RUNNER_IP = null;
 let MAX_AREAS = 2;
 
+// Heartbeat: keeps noon_ranking_run_machine.last_seen_at fresh while an area
+// is being paginated at real-app pace (an area can take 5–10 min with no
+// other Supabase contact). Without it the tick's silent-timeout watchdog
+// marks healthy machines 'lost' and re-queues their areas. Fire-and-forget.
+let lastBeat = Date.now();
+function heartbeat(force = false) {
+  if (!force && Date.now() - lastBeat < 60000) return;
+  lastBeat = Date.now();
+  fetch(`${SUPABASE_URL}/rest/v1/noon_ranking_run_machine?run_id=eq.${RUN_ID}&machine_no=eq.${MACHINE}`, {
+    method: 'PATCH',
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+    body: JSON.stringify({ last_seen_at: new Date().toISOString() }),
+    signal: AbortSignal.timeout(5000),
+  }).then((r) => { if (!r.ok) say(`heartbeat HTTP ${r.status}`); }).catch((e) => say(`heartbeat failed: ${e.message}`));
+}
+
 async function audit(row) {
   try {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/noon_scrape_audit`, {
@@ -517,7 +533,7 @@ function parseCards(outlets, nonFoodSet) {
     let claim;
     for (;;) {
       claim = await rpc('noon_ranking_claim', { p_run_id: RUN_ID, p_machine_no: MACHINE });
-      if (claim && claim.noon_area_id == null && claim.wait_ms > 0) { await sleep(claim.wait_ms); continue; }
+      if (claim && claim.noon_area_id == null && claim.wait_ms > 0) { heartbeat(true); await sleep(claim.wait_ms); continue; }
       break;
     }
     if (!claim || claim.noon_area_id == null) { say(`no area: ${claim && claim.reason}`); exitReason = 'no_more_areas'; break; }
@@ -530,6 +546,8 @@ function parseCards(outlets, nonFoodSet) {
     say(`=== AREA ${areaIdx + 1}/${MAX_AREAS}: ${areaName} id=${areaId} (${lat},${lng}) ===`);
 
     const areaStart = Date.now();
+    AREA_LOG = newAreaLog();
+    const deviceAtStart = deviceId;
     const reqBefore = NOON_REQ;
     const rotBefore = identityRotations, recBefore = recoveryAttempts;
     let pagesDone = 0;
@@ -538,6 +556,14 @@ function parseCards(outlets, nonFoodSet) {
     let stopReason = null;
     const seen = new Set();
     const captures = [];
+
+    const auditVisibility = () => ({
+      rotations: AREA_LOG.rotations, recoveries: AREA_LOG.recoveries, recoveries_ok: AREA_LOG.recoveries_ok,
+      remints: AREA_LOG.remints, search_403: AREA_LOG.search_403, search_429: AREA_LOG.search_429,
+      et_posts: AREA_LOG.et_posts, et_events: AREA_LOG.et_events, et_non2xx: AREA_LOG.et_non2xx,
+      device_id_start: shortId(deviceAtStart), device_id_end: shortId(deviceId),
+      req_log: AREA_LOG.log,
+    });
 
     const buildFdHeaders = () => {
       const h = { ...base(), 'x-experience': 'food', 'x-locale': 'en-ae',
@@ -605,6 +631,7 @@ function parseCards(outlets, nonFoodSet) {
     try {
       if (areaIdx === 0) {
         // --- 4-call mint with telemetry (v3 verbatim) ---
+        say(`MINT start: device=${shortId(deviceId)} visitor=${shortId(visitorId)} ip=${RUNNER_IP || '?'}`);
         let r = await curlCallWithRetry('mint_whoami', WHOAMI_URL, {
           headers: { ...base(), 'x-experience': 'ecom', 'x-whoami-request-id': crypto.randomUUID() }, cookieJar: jar });
         say(`${r.step}: ${r.status} in ${r.ms}ms`);
@@ -642,7 +669,9 @@ function parseCards(outlets, nonFoodSet) {
         if (r.status !== 200) throw fail(r);
         mergeWho(r.body);
         lastMintAt = Date.now();
+        say(`MINT done: nguestv2 set, zone=${whoHeaders['x-food-zonecode'] || '-'} in ${Math.round((Date.now() - areaStart) / 1000)}s`);
       } else {
+        say(`AREA TRANSITION: same session, device=${shortId(deviceId)} visitor=${shortId(visitorId)}, token age ${Math.round((Date.now() - lastMintAt) / 1000)}s`);
         // --- Area transition: set-location + conditional remint (v3 verbatim) ---
         await sleep(800 + Math.random() * 700);
         const r = await curlCallWithRetry('area_set_location', SET_LOCATION_URL, {
@@ -662,6 +691,7 @@ function parseCards(outlets, nonFoodSet) {
 
       // --- Pagination (v3 verbatim, page cap from Supabase claim) ---
       while (pagesDone < maxPages) {
+        heartbeat();
         if (SPEC.periodic_identity_rotation.enabled && pagesDone > 0) {
           const every = SPEC.periodic_identity_rotation.every_pages;
           const atList = SPEC.periodic_identity_rotation.at_pages || [];
@@ -763,6 +793,7 @@ function parseCards(outlets, nonFoodSet) {
         req_before: reqBefore, req_area: NOON_REQ - reqBefore, elapsed_ms: Date.now() - areaStart,
         outcome: kind, pages: pagesDone, fail_step: failStep(e.step), fail_page: e.step === 'search' ? pagesDone + 1 : null,
         http_status: e.status || null, error: String(e.message).slice(0, 300),
+        ...auditVisibility(),
       });
       const rep = await rpc('noon_ranking_report', {
         p_run_id: RUN_ID, p_machine_no: MACHINE, p_area_id: areaId,
@@ -800,6 +831,7 @@ function parseCards(outlets, nonFoodSet) {
       outcome: 'ok', pages: pagesDone, cards: captures.length,
       rows_parsed: parsed.rows.length, rows_saved: savedAnalysis,
       stop_reason: `${stopReason} rot=${identityRotations - rotBefore} rec=${recoveryAttempts - recBefore} remints=${remintCount} pauses=${distractionPauses} gap=${PAGE_GAP_MS_MIN}-${PAGE_GAP_MS_MAX} imp=${IMPRESSIONS_PER_PAGE}`,
+      ...auditVisibility(),
     });
     totalAreas++; totalRows += parsed.rows.length; totalDropped += parsed.dropped;
     say(`${areaName} ok: ${captures.length} cards, ${parsed.rows.length} rows (${parsed.dropped} non-food dropped), ${pagesDone}p, ${Math.round(elapsed / 1000)}s, recoveries=${recoveryAttempts - recBefore} | ${stopReason} | saved=${savedAnalysis} pending=${savedPending} -> ${rep && rep.action}`);
