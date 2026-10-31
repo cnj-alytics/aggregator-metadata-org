@@ -1,0 +1,65 @@
+name: Noon UAE – Lab TLS v2.14 (bug-fix pacing + random distraction pauses)
+run-name: v2.14 test ${{ inputs.test_id }} m${{ inputs.machine_no }}
+
+# v2.14 — two changes from v2.13:
+#  (a) Bug fix: restore the pre-search sleep that was dropped in the v2.12 refactor.
+#      v2.13 was effectively running at ~2s per page (telemetry overhead only).
+#  (b) New: 20% chance per page of adding an extra 3-7s "distraction pause"
+#      on top of the normal gap, to break the uniform cadence Akamai detects.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_id:
+        description: 'noon_lab.test.test_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'noon_lab.machine.machine_no'
+        required: true
+        type: string
+
+concurrency:
+  group: noon-lab-v214-${{ inputs.test_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    name: v2.14 probe test ${{ inputs.test_id }} machine ${{ inputs.machine_no }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: noon-uae-lab-v2
+      - name: Install curl-impersonate
+        run: |
+          set -e
+          cd /tmp
+          curl -sSL -o ci.tar.gz "https://github.com/lwthiker/curl-impersonate/releases/download/v0.6.1/curl-impersonate-v0.6.1.x86_64-linux-gnu.tar.gz"
+          mkdir -p /opt/ci
+          tar -xzf ci.tar.gz -C /opt/ci
+          echo "/opt/ci" >> $GITHUB_PATH
+      - name: Install Node deps for reporter
+        working-directory: noon-uae-lab-v2
+        run: npm install --omit=dev --no-audit --no-fund
+      - name: v2.14 probe (pauses)
+        working-directory: noon-uae-lab-v2
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TEST_ID: ${{ inputs.test_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          IMPERSONATE_WRAPPER: curl_safari15_3
+          PAGE_GAP_MS_MIN: '5500'
+          PAGE_GAP_MS_MAX: '7800'
+          TOKEN_REFRESH_AT_MS_MIN: '210000'
+          TOKEN_REFRESH_AT_MS_MAX: '260000'
+          IMPRESSIONS_PER_PAGE_MIN: '4'
+          IMPRESSIONS_PER_PAGE_MAX: '10'
+          MAX_AREAS: '2'
+          PAUSE_PROBABILITY: '0.20'
+          PAUSE_MS_MIN: '3000'
+          PAUSE_MS_MAX: '7000'
+        run: node tls-probe-v214-pauses.js
