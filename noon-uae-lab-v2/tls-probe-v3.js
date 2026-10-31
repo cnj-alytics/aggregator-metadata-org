@@ -567,6 +567,7 @@ function fireEtracker(session, step, events) {
     let cards = 0;
     let setupMs = null;
     let searchToken = null;
+    let distractionPauses = 0;  // v3: declared at area scope so stop_reason can read it
     const seen = new Set();
     // v2.13: accumulate per-outlet rows for this area to upload with the report.
     // Only FRESH outlets (not previously seen in this area) are stored, with their
@@ -796,7 +797,6 @@ function fireEtracker(session, step, events) {
       };
 
       // Paginate /search until block or empty (recovery on-block controlled by spec)
-      let distractionPauses = 0;
       while (pagesDone < 60) {
         // v3: periodic identity rotation (configurable)
         if (SPEC.periodic_identity_rotation.enabled && pagesDone > 0) {
