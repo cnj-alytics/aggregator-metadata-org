@@ -89,6 +89,19 @@ function ensureCurl() {
 let CURL = null; // resolved at start
 let NOON_REQ = 0;
 
+// Per-area visibility: every Noon call is recorded here and saved to
+// noon_scrape_audit.req_log (plus counters) when the area ends.
+let AREA_LOG = null;
+const REQ_LOG_CAP = 600;
+function newAreaLog() {
+  return { t0: Date.now(), log: [], rotations: 0, recoveries: 0, recoveries_ok: 0, remints: 0,
+    search_403: 0, search_429: 0, et_posts: 0, et_events: 0, et_non2xx: 0 };
+}
+function logReq(entry) {
+  if (!AREA_LOG) return;
+  if (AREA_LOG.log.length < REQ_LOG_CAP) AREA_LOG.log.push({ t: Date.now() - AREA_LOG.t0, ...entry });
+}
+
 // curl-impersonate call -> {step, status, ms, headers, setCookies, body}. (v3 verbatim)
 function curlCall(step, url, { method = 'GET', headers = {}, body = null, cookieJar = null } = {}) {
   const args = ['-sS', '-i', '--max-time', '20', '-X', method];
@@ -106,7 +119,9 @@ function curlCall(step, url, { method = 'GET', headers = {}, body = null, cookie
   try {
     raw = execFileSync(CURL, args, { encoding: 'utf-8', timeout: 22000, maxBuffer: 20 * 1024 * 1024 });
   } catch (e) {
-    return { step, status: null, ms: Date.now() - t0, error: String(e.message || e).slice(0, 300) };
+    const err = String(e.message || e).slice(0, 300);
+    logReq({ step, st: null, ms: Date.now() - t0, err: err.slice(0, 120) });
+    return { step, status: null, ms: Date.now() - t0, error: err };
   }
   const ms = Date.now() - t0;
 
@@ -135,6 +150,7 @@ function curlCall(step, url, { method = 'GET', headers = {}, body = null, cookie
       if (m) cookieJar[m[1]] = m[2];
     }
   }
+  logReq({ step, st: status, ms, ck: setCookies.length || undefined });
   return { step, status, ms, headers: headersMap, setCookies, body: bodyText };
 }
 
@@ -481,10 +497,17 @@ function parseCards(outlets, nonFoodSet) {
     'Accept-Encoding': 'gzip, deflate, br', 'Cache-Control': 'no-cache', Connection: 'keep-alive',
     'x-device-id': deviceId, 'x-visitor-id': visitorId, ...sentryTrace(),
   });
-  const et = (step, events) => curlCall(step, ETRACKER_URL, {
-    method: 'POST', headers: { ...base(), 'Content-Type': 'text/plain;charset=UTF-8' },
-    body: JSON.stringify(events), cookieJar: jar,
-  });
+  const et = (step, events) => {
+    const r = curlCall(step, ETRACKER_URL, {
+      method: 'POST', headers: { ...base(), 'Content-Type': 'text/plain;charset=UTF-8' },
+      body: JSON.stringify(events), cookieJar: jar,
+    });
+    const ok = r.status >= 200 && r.status < 300;
+    if (AREA_LOG) { AREA_LOG.et_posts++; AREA_LOG.et_events += events.length; if (!ok) AREA_LOG.et_non2xx++; }
+    say(`  telemetry ${step}: ${r.status} (${events.length} events: ${[...new Set(events.map((e) => e.ev))].join(',')}) ${r.ms}ms`);
+    return r;
+  };
+  const shortId = (id) => String(id).slice(0, 8);
   const fail = (r) => Object.assign(new Error(`${r.step} ${r.status}`), { step: r.step, status: r.status });
 
   for (let areaIdx = 0; !sessionKilled && areaIdx < MAX_AREAS; areaIdx++) {
@@ -536,12 +559,15 @@ function parseCards(outlets, nonFoodSet) {
     const dualRemint = async (reason) => {
       remintCount++;
       const tag = `remint${remintCount}`;
-      say(`${tag}: ${reason}`);
+      if (AREA_LOG) AREA_LOG.remints++;
+      say(`REMINT ${tag}: ${reason} (device=${shortId(deviceId)} visitor=${shortId(visitorId)})`);
       let rr = await curlCallWithRetry(`${tag}_st_whoami`, WHOAMI_URL, {
         headers: { ...base(), 'x-experience': 'ecom', 'x-whoami-request-id': crypto.randomUUID() }, cookieJar: jar });
+      say(`  ${rr.step}: ${rr.status} in ${rr.ms}ms`);
       if (rr.status !== 200) throw fail(rr);
       await sleep(200 + Math.random() * 400);
       rr = await curlCallWithRetry(`${tag}_fd_whoami`, FD_WHOAMI_URL, { headers: buildFdHeaders(), cookieJar: jar });
+      say(`  ${rr.step}: ${rr.status} in ${rr.ms}ms`);
       if (rr.status !== 200) throw fail(rr);
       mergeWho(rr.body);
       await sleep(100 + Math.random() * 200);
@@ -550,7 +576,8 @@ function parseCards(outlets, nonFoodSet) {
     };
 
     const applyStrategy = async (name) => {
-      say(`  recovery: ${name} (attempt ${recoveryAttempts + 1})`);
+      const devBefore = deviceId, visBefore = visitorId;
+      if (AREA_LOG) AREA_LOG.recoveries++;
       if (name === 'swap_device_id') { deviceId = crypto.randomUUID().toUpperCase(); identityRotations++; }
       else if (name === 'swap_visitor_id') { visitorId = crypto.randomUUID().toLowerCase(); identityRotations++; }
       else if (name === 'swap_both_ids') { deviceId = crypto.randomUUID().toUpperCase(); visitorId = crypto.randomUUID().toLowerCase(); identityRotations++; }
@@ -568,6 +595,9 @@ function parseCards(outlets, nonFoodSet) {
           lastMintAt = Date.now();
         }
       } else say(`  WARNING: unknown recovery strategy "${name}"`);
+      say(`  RECOVERY ${recoveryAttempts + 1}: ${name} | device ${shortId(devBefore)} -> ${shortId(deviceId)} | visitor ${shortId(visBefore)} -> ${shortId(visitorId)}`);
+      logReq({ step: `recovery_${name}`, dev: `${shortId(devBefore)}>${shortId(deviceId)}`, vis: visBefore === visitorId ? undefined : `${shortId(visBefore)}>${shortId(visitorId)}` });
+      if (AREA_LOG && deviceId !== devBefore) AREA_LOG.rotations++;
       recoveryAttempts++;
       if (SPEC.on_search_block.backoff_ms > 0) await sleep(SPEC.on_search_block.backoff_ms + Math.random() * 1000);
     };
@@ -675,6 +705,12 @@ function parseCards(outlets, nonFoodSet) {
           const h = { ...buildFdHeaders(), 'Content-Type': 'application/json' };
           sr = curlCall(attempt === 0 ? 'search' : `search_recovery_${attempt}`, SEARCH_URL, {
             method: 'POST', headers: h, body: JSON.stringify(searchBody), cookieJar: jar });
+          if (AREA_LOG && sr.status === 403) AREA_LOG.search_403++;
+          if (AREA_LOG && sr.status === 429) AREA_LOG.search_429++;
+          if (sr.status !== 200 || attempt > 0) {
+            say(`search page ${pagesDone + 1}${attempt > 0 ? ` (recovery ${attempt})` : ''}: ${sr.status === null ? `NO RESPONSE (${sr.error && sr.error.slice(0, 80)})` : sr.status} in ${sr.ms}ms device=${shortId(deviceId)}`);
+          }
+          if (sr.status === 200 && attempt > 0 && AREA_LOG) { AREA_LOG.recoveries_ok++; say(`  RECOVERED on attempt ${attempt} with device ${shortId(deviceId)}`); }
           if (sr.status === 200) break;
           if (!SPEC.on_search_block.enabled || (sr.status !== 403 && sr.status !== 429) || attempt >= maxRec) break;
           const strategies = SPEC.on_search_block.strategies || [];
