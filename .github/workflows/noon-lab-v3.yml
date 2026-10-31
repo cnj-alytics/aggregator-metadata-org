@@ -1,0 +1,53 @@
+name: Noon UAE – Lab TLS v3 (universal adaptive probe)
+run-name: v3 test ${{ inputs.test_id }} m${{ inputs.machine_no }}
+
+# v3 — one binary, config-driven.
+# All experiment behavior is read from noon_lab.variant.spec at claim time.
+# Change parameters by UPDATE'ing the spec JSONB in Supabase; no code push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_id:
+        description: 'noon_lab.test.test_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'noon_lab.machine.machine_no'
+        required: true
+        type: string
+
+concurrency:
+  group: noon-lab-v3-${{ inputs.test_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    name: v3 probe test ${{ inputs.test_id }} machine ${{ inputs.machine_no }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: noon-uae-lab-v2
+      - name: Install curl-impersonate
+        run: |
+          set -e
+          cd /tmp
+          curl -sSL -o ci.tar.gz "https://github.com/lwthiker/curl-impersonate/releases/download/v0.6.1/curl-impersonate-v0.6.1.x86_64-linux-gnu.tar.gz"
+          mkdir -p /opt/ci
+          tar -xzf ci.tar.gz -C /opt/ci
+          echo "/opt/ci" >> $GITHUB_PATH
+      - name: Install Node deps for reporter
+        working-directory: noon-uae-lab-v2
+        run: npm install --omit=dev --no-audit --no-fund
+      - name: v3 adaptive probe
+        working-directory: noon-uae-lab-v2
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TEST_ID: ${{ inputs.test_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          IMPERSONATE_WRAPPER: curl_safari15_3
+        run: node tls-probe-v3.js
