@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 // noon/uae/ranking-scrape.js — PRODUCTION (v3 network layer + v1 output)
+// MINT v4 (2026-11-01): 1-call mint (st whoami) with zone headers from noon_lab.mint_zone_cache via claim;
+//   swap-and-retry on blocked identity calls; no token refresh; area 2 skips set-location when cached.
+//   Cache miss → full 4-call mint with swap-and-retry. Lab-tested as noon-mint-lab/ranking-candidate.js.
 //
 // One GitHub runner = one machine = one IP = one Noon guest session.
 // Dispatched by Supabase (noon_ranking_dispatch_machine) to either the
@@ -526,6 +529,27 @@ function parseCards(outlets, nonFoodSet) {
   const shortId = (id) => String(id).slice(0, 8);
   const fail = (r) => Object.assign(new Error(`${r.step} ${r.status}`), { step: r.step, status: r.status });
 
+  // CANDIDATE: identity call = production's 1 plain retry, then swap ids + pause + retry on 403/429.
+  const MINT_RETRY = (start && start.mint_retry) || { max_attempts: 6, backoff_ms: 6000, swap: 'both' };
+  let mintSwaps = 0;
+  const mintCall = async (step, url, optsFn) => {
+    const maxA = Number(MINT_RETRY.max_attempts) || 0;
+    for (let a = 0; ; a++) {
+      const r = await curlCallWithRetry(a === 0 ? step : `${step}_swap${a}`, url, optsFn());
+      say(`${r.step}: ${r.status} in ${r.ms}ms dev=${shortId(deviceId)}`);
+      if (r.status === 200 || a >= maxA || (r.status !== 403 && r.status !== 429)) { r.baseStep = step; return r; }
+      const devBefore = deviceId;
+      const mode = MINT_RETRY.swap || 'both';
+      if (mode === 'device' || mode === 'both') deviceId = crypto.randomUUID().toUpperCase();
+      if (mode === 'visitor' || mode === 'both') visitorId = crypto.randomUUID().toLowerCase();
+      mintSwaps++; identityRotations++;
+      say(`  MINT SWAP ${a + 1}/${maxA} at ${step}: device ${shortId(devBefore)} -> ${shortId(deviceId)}`);
+      logReq({ step: `mint_swap_${step}`, dev: `${shortId(devBefore)}>${shortId(deviceId)}` });
+      await sleep((Number(MINT_RETRY.backoff_ms) || 6000) + Math.random() * 1000);
+    }
+  };
+  const mintFail = (r) => Object.assign(new Error(`${r.step} ${r.status}`), { step: r.baseStep || r.step, status: r.status });
+
   for (let areaIdx = 0; !sessionKilled && areaIdx < MAX_AREAS; areaIdx++) {
     if (Date.now() - START_TIME > WALL_LIMIT_MS) { exitReason = 'wall_limit'; break; }
 
@@ -547,6 +571,14 @@ function parseCards(outlets, nonFoodSet) {
 
     const areaStart = Date.now();
     AREA_LOG = newAreaLog();
+    const zoneCached = !!(claim.zone_headers && typeof claim.zone_headers === 'object' && Object.keys(claim.zone_headers).length);
+    let harvestedZone = null;
+    const swapsBefore = mintSwaps;
+    const mintStats = () => {
+      const idl = AREA_LOG.log.filter((e) => /^(mint_|area_set_location)/.test(e.step) && !/^mint_swap_/.test(e.step));
+      return { zone_cached: zoneCached, mint_calls: idl.length, mint_403: idl.filter((e) => e.st === 403 || e.st === 429).length,
+               mint_swaps: mintSwaps - swapsBefore, ...(harvestedZone ? { zone_headers: harvestedZone } : {}) };
+    };
     const deviceAtStart = deviceId;
     const reqBefore = NOON_REQ;
     const rotBefore = identityRotations, recBefore = recoveryAttempts;
@@ -631,32 +663,36 @@ function parseCards(outlets, nonFoodSet) {
     try {
       if (areaIdx === 0) {
         // --- 4-call mint with telemetry (v3 verbatim) ---
-        say(`MINT start: device=${shortId(deviceId)} visitor=${shortId(visitorId)} ip=${RUNNER_IP || '?'}`);
-        let r = await curlCallWithRetry('mint_whoami', WHOAMI_URL, {
-          headers: { ...base(), 'x-experience': 'ecom', 'x-whoami-request-id': crypto.randomUUID() }, cookieJar: jar });
-        say(`${r.step}: ${r.status} in ${r.ms}ms`);
-        if (r.status !== 200) throw fail(r);
+        say(`MINT start (${zoneCached ? '1-call, zone headers from cache' : 'FULL — no cached zone headers'}): device=${shortId(deviceId)} visitor=${shortId(visitorId)} ip=${RUNNER_IP || '?'}`);
+        let r = await mintCall('mint_whoami', WHOAMI_URL, () => ({
+          headers: { ...base(), 'x-experience': 'ecom', 'x-whoami-request-id': crypto.randomUUID() }, cookieJar: jar }));
+        if (r.status !== 200) throw mintFail(r);
 
         await sleep(300 + Math.random() * 300);
         et('et_mint_launch', [evLaunch(visitorId, deviceIdfv), evLaunchInfo(visitorId, deviceIdfv), evAppForeground(visitorId, deviceIdfv)]);
 
+        if (zoneCached) {
+          if (!jar.nguestv2) throw Object.assign(new Error('mint produced no nguestv2'), { step: 'mint_whoami', status: null });
+          whoHeaders = { ...claim.zone_headers };
+          lastMintAt = Date.now();
+          say(`MINT done (1 call): nguestv2 set, zone=${whoHeaders['x-food-zonecode'] || '-'} in ${Math.round((Date.now() - areaStart) / 1000)}s`);
+        } else {
+
         await sleep(1200 + Math.random() * 800);
-        r = await curlCallWithRetry('mint_set_location', SET_LOCATION_URL, {
+        r = await mintCall('mint_set_location', SET_LOCATION_URL, () => ({
           method: 'POST',
           headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae', 'x-device-lat': String(lat), 'x-device-lng': String(lng), 'Content-Type': 'application/json' },
-          body: JSON.stringify({ location: { lat, lng }, lang: 'en' }), cookieJar: jar });
-        say(`${r.step}: ${r.status} in ${r.ms}ms`);
-        if (r.status !== 200) throw fail(r);
+          body: JSON.stringify({ location: { lat, lng }, lang: 'en' }), cookieJar: jar }));
+        if (r.status !== 200) throw mintFail(r);
 
         await sleep(200 + Math.random() * 300);
         et('et_mint_location', [evLocationFetch(visitorId, deviceIdfv), evPageHome(visitorId, deviceIdfv)]);
 
         await sleep(400 + Math.random() * 300);
-        r = await curlCallWithRetry('mint_whoami_food', WHOAMI_FOOD_URL, {
+        r = await mintCall('mint_whoami_food', WHOAMI_FOOD_URL, () => ({
           headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae', 'x-device-lat': String(lat), 'x-device-lng': String(lng), 'x-whoami-request-id': crypto.randomUUID() },
-          cookieJar: jar });
-        say(`${r.step}: ${r.status} in ${r.ms}ms`);
-        if (r.status !== 200) throw fail(r);
+          cookieJar: jar }));
+        if (r.status !== 200) throw mintFail(r);
         try { const w = JSON.parse(r.body); whoHeaders = (w && w.headers && typeof w.headers === 'object') ? w.headers : {}; } catch (_) {}
         if (!jar.nguestv2) throw Object.assign(new Error('mint produced no nguestv2'), { step: 'mint_whoami_food', status: null });
 
@@ -664,29 +700,31 @@ function parseCards(outlets, nonFoodSet) {
         et('et_mint_zone', [evWhoamiAbConfig(whoHeaders, visitorId, deviceIdfv), evSelectedZone(whoHeaders, visitorId, deviceIdfv)]);
 
         await sleep(800 + Math.random() * 1200);
-        r = await curlCallWithRetry('mint_fd_whoami', FD_WHOAMI_URL, { headers: buildFdHeaders(), cookieJar: jar });
-        say(`${r.step}: ${r.status} in ${r.ms}ms`);
-        if (r.status !== 200) throw fail(r);
+        r = await mintCall('mint_fd_whoami', FD_WHOAMI_URL, () => ({ headers: buildFdHeaders(), cookieJar: jar }));
+        if (r.status !== 200) throw mintFail(r);
         mergeWho(r.body);
         lastMintAt = Date.now();
-        say(`MINT done: nguestv2 set, zone=${whoHeaders['x-food-zonecode'] || '-'} in ${Math.round((Date.now() - areaStart) / 1000)}s`);
+        harvestedZone = Object.fromEntries(Object.entries(whoHeaders).filter(([, v]) => v != null && typeof v !== 'object'));
+        say(`MINT done (full): nguestv2 set, zone=${whoHeaders['x-food-zonecode'] || '-'} in ${Math.round((Date.now() - areaStart) / 1000)}s`);
+        }
+      } else if (zoneCached) {
+        // CANDIDATE: same session, new location — no identity call, no refresh.
+        whoHeaders = { ...claim.zone_headers };
+        say(`AREA TRANSITION (no set-location): device=${shortId(deviceId)} zone=${whoHeaders['x-food-zonecode'] || '-'} token age ${Math.round((Date.now() - lastMintAt) / 1000)}s`);
+        await sleep(800 + Math.random() * 700);
+        et('et_area_transition', [evLocationFetch(visitorId, deviceIdfv)]);
       } else {
         say(`AREA TRANSITION: same session, device=${shortId(deviceId)} visitor=${shortId(visitorId)}, token age ${Math.round((Date.now() - lastMintAt) / 1000)}s`);
         // --- Area transition: set-location + conditional remint (v3 verbatim) ---
         await sleep(800 + Math.random() * 700);
-        const r = await curlCallWithRetry('area_set_location', SET_LOCATION_URL, {
+        const r = await mintCall('area_set_location', SET_LOCATION_URL, () => ({
           method: 'POST',
           headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae', 'x-device-lat': String(lat), 'x-device-lng': String(lng), 'Content-Type': 'application/json' },
-          body: JSON.stringify({ location: { lat, lng }, lang: 'en' }), cookieJar: jar });
-        say(`${r.step}: ${r.status} in ${r.ms}ms`);
-        if (r.status !== 200) throw fail(r);
+          body: JSON.stringify({ location: { lat, lng }, lang: 'en' }), cookieJar: jar }));
+        if (r.status !== 200) throw mintFail(r);
         await sleep(200 + Math.random() * 300);
         et('et_area_transition', [evLocationFetch(visitorId, deviceIdfv)]);
-        const age = Date.now() - lastMintAt;
-        if (age > TOKEN_REFRESH_AT_MS) {
-          await sleep(400 + Math.random() * 600);
-          await dualRemint(`token age ${Math.round(age / 1000)}s > ${TOKEN_REFRESH_AT_MS / 1000}s`);
-        }
+        // CANDIDATE: no token refresh.
       }
 
       // --- Pagination (v3 verbatim, page cap from Supabase claim) ---
@@ -710,7 +748,7 @@ function parseCards(outlets, nonFoodSet) {
           await sleep(Math.max(0, PAGE_GAP_MS_MIN - 1500) + Math.random() * Math.max(0, PAGE_GAP_MS_MAX - PAGE_GAP_MS_MIN));
         }
         const age = Date.now() - lastMintAt;
-        if (SPEC.token_refresh.enabled && age > TOKEN_REFRESH_AT_MS) {
+        if (false && SPEC.token_refresh.enabled && age > TOKEN_REFRESH_AT_MS) { // CANDIDATE: token refresh disabled
           await sleep(500 + Math.random() * 800);
           await dualRemint(`token age ${Math.round(age / 1000)}s at page ${pagesDone}`);
           await sleep(400 + Math.random() * 600);
@@ -793,7 +831,7 @@ function parseCards(outlets, nonFoodSet) {
         req_before: reqBefore, req_area: NOON_REQ - reqBefore, elapsed_ms: Date.now() - areaStart,
         outcome: kind, pages: pagesDone, fail_step: failStep(e.step), fail_page: e.step === 'search' ? pagesDone + 1 : null,
         http_status: e.status || null, error: String(e.message).slice(0, 300),
-        ...auditVisibility(),
+        ...auditVisibility(), ...mintStats(),
       });
       const rep = await rpc('noon_ranking_report', {
         p_run_id: RUN_ID, p_machine_no: MACHINE, p_area_id: areaId,
@@ -831,7 +869,7 @@ function parseCards(outlets, nonFoodSet) {
       outcome: 'ok', pages: pagesDone, cards: captures.length,
       rows_parsed: parsed.rows.length, rows_saved: savedAnalysis,
       stop_reason: `${stopReason} rot=${identityRotations - rotBefore} rec=${recoveryAttempts - recBefore} remints=${remintCount} pauses=${distractionPauses} gap=${PAGE_GAP_MS_MIN}-${PAGE_GAP_MS_MAX} imp=${IMPRESSIONS_PER_PAGE}`,
-      ...auditVisibility(),
+      ...auditVisibility(), ...mintStats(),
     });
     totalAreas++; totalRows += parsed.rows.length; totalDropped += parsed.dropped;
     say(`${areaName} ok: ${captures.length} cards, ${parsed.rows.length} rows (${parsed.dropped} non-food dropped), ${pagesDone}p, ${Math.round(elapsed / 1000)}s, recoveries=${recoveryAttempts - recBefore} | ${stopReason} | saved=${savedAnalysis} pending=${savedPending} -> ${rep && rep.action}`);
