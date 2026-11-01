@@ -1,0 +1,47 @@
+name: Noon UAE – Candidate scraper lab (new minting)
+run-name: candidate run ${{ inputs.run_id }} m${{ inputs.machine_no }}
+
+# LAB ONLY — not production. Dispatched by Supabase noon_lab.cand_dispatch().
+# Runs noon-mint-lab/ranking-candidate.js: the production scraper with only the
+# minting changed. Talks to lab RPCs (noon_cand_*); saves nothing to production.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'noon_lab.cand_run.run_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'noon_lab.cand_machine.machine_no'
+        required: true
+        type: string
+
+concurrency:
+  group: noon-candidate-lab-${{ inputs.run_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    name: candidate run ${{ inputs.run_id }} machine ${{ inputs.machine_no }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: noon-mint-lab
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Candidate scrape
+        working-directory: noon-mint-lab
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_ID: ${{ inputs.run_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          WALL_LIMIT_SEC: '4000'
+        run: node ranking-candidate.js
