@@ -1,0 +1,50 @@
+name: Noon UAE – Mint lab (guest token experiment)
+run-name: mint lab t${{ inputs.test_id }} m${{ inputs.machine_no }}
+
+# STANDALONE EXPERIMENT — not production. Dispatched by Supabase
+# noon_lab.mint_dispatch(). Each run = one attempt of one mint variant
+# (variant + area are assigned by noon_mint_lab_claim). Results land in
+# noon_lab.mint_attempt; summary in noon_lab.mint_results.
+#
+# Uses the repo's existing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY secrets.
+# Production's noon/uae/ranking-scrape.js is not touched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_id:
+        description: 'noon_lab.mint_test.test_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'noon_lab.mint_machine.machine_no'
+        required: true
+        type: string
+
+concurrency:
+  group: noon-mint-lab-${{ inputs.test_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  mint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    name: mint lab t${{ inputs.test_id }} m${{ inputs.machine_no }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: noon-mint-lab
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Mint lab attempt
+        working-directory: noon-mint-lab
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TEST_ID: ${{ inputs.test_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: node mint-lab.js
