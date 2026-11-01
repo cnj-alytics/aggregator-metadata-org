@@ -348,6 +348,10 @@ async function rpc(name, params) {
     }
   };
 
+  const setLocOpts = () => ({ method: 'POST',
+    headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae', 'x-device-lat': String(lat), 'x-device-lng': String(lng), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ location: { lat, lng }, lang: 'en' }), cookieJar: jar });
+
   const result = { steps: null, identity_calls: 0, identity_403: 0, swaps: 0, got_token: false,
     search_ok: 0, search_tried: 0, search_403: 0, search_other: 0, page1_outlets: 0, page1_codes: [] };
   const setupStart = Date.now();
@@ -396,6 +400,21 @@ async function rpc(name, params) {
       await sleep(rnd(300, 600));
       et('et_mint_launch', [evLaunch(visitorId, deviceIdfv), evLaunchInfo(visitorId, deviceIdfv), evAppForeground(visitorId, deviceIdfv)]);
       whoHeaders = { ...(claim.zone_headers || {}) };
+    } else if (spec.setup === 'whoami_bmsc') {
+      // Like the app: whoami (nguestv2) → set-location (issues Akamai ak_bmsc + dcae + x-location cookies).
+      // Zone headers from cache (no whoami-food / fd whoami).
+      etInit('et_init_1');
+      let r = await identity('mint_whoami', WHOAMI_URL, () => ({
+        headers: { ...base(), 'x-experience': 'ecom', 'x-whoami-request-id': crypto.randomUUID() }, cookieJar: jar }));
+      if (r.status !== 200) throw Object.assign(new Error(`${r.step} ${r.status}`), { step: 'mint_whoami', status: r.status });
+      await sleep(rnd(300, 600));
+      et('et_mint_launch', [evLaunch(visitorId, deviceIdfv), evLaunchInfo(visitorId, deviceIdfv), evAppForeground(visitorId, deviceIdfv)]);
+      await sleep(rnd(1200, 2000));
+      r = await identity('mint_set_location', SET_LOCATION_URL, setLocOpts);
+      if (r.status !== 200) throw Object.assign(new Error(`${r.step} ${r.status}`), { step: 'mint_set_location', status: r.status });
+      await sleep(rnd(200, 500));
+      et('et_mint_location', [evLocationFetch(visitorId, deviceIdfv), evPageHome(visitorId, deviceIdfv)]);
+      whoHeaders = { ...(claim.zone_headers || {}) };
     } else if (spec.setup === 'none') {
       whoHeaders = spec.zone_headers === 'cache' ? { ...(claim.zone_headers || {}) } : {};
       et('et_mint_launch', [evLaunch(visitorId, deviceIdfv), evLaunchInfo(visitorId, deviceIdfv), evAppForeground(visitorId, deviceIdfv)]);
@@ -424,6 +443,17 @@ async function rpc(name, params) {
   let searchFail = null;
   if (!setupFail) {
     let searchToken = null;
+    // How a blocked search page is recovered (spec.search_recovery):
+    //   swap_device   — production: new device id, 6s pause (default)
+    //   keep_device   — same identity, just pause (a real phone can't change its device id)
+    //   refresh_bmsc  — same device id, call set-location again (fresh ak_bmsc), pause
+    //   swap_refresh  — new device id AND fresh ak_bmsc via set-location, pause
+    const RECOVERY = spec.search_recovery || 'swap_device';
+    const MAX_REC = Number(spec.search_max_recoveries ?? 12);
+    result.bmsc_at_search = !!jar.ak_bmsc;
+    result.cookies_at_search = Object.keys(jar).sort();
+    result.recovery = RECOVERY;
+    result.page_recoveries = [];
     for (let p = 1; p <= SEARCH_PAGES; p++) {
       if (p > 1) await sleep(rnd(0, 3750));     // production pacing (1.25–5s incl. telemetry)
       const body = {
@@ -439,18 +469,26 @@ async function rpc(name, params) {
       };
       if (searchToken) body.searchToken = searchToken;
       let sr;
-      for (let a = 0; a <= 12; a++) {
+      let a = 0;
+      for (; a <= MAX_REC; a++) {
         sr = curlCall(a === 0 ? `search_p${p}` : `search_p${p}_rec${a}`, SEARCH_URL, {
           method: 'POST', headers: { ...buildFdHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify(body), cookieJar: jar });
         result.search_tried++;
         if (sr.status === 403 || sr.status === 429) result.search_403++;
         else if (sr.status !== 200) result.search_other++;
-        say(`  search p${p}${a ? ` rec${a}` : ''}: ${sr.status} ${sr.ms}ms dev=${shortId(deviceId)}`);
+        say(`  search p${p}${a ? ` rec${a}` : ''}: ${sr.status} ${sr.ms}ms dev=${shortId(deviceId)} bmsc=${jar.ak_bmsc ? 1 : 0}`);
         if (sr.status === 200) { result.search_ok++; break; }
         if (sr.status !== 403 && sr.status !== 429) break;
-        doSwap('device');
+        if (a === MAX_REC) break;
+        if (RECOVERY === 'swap_device' || RECOVERY === 'swap_refresh') doSwap('device');
+        if (RECOVERY === 'refresh_bmsc' || RECOVERY === 'swap_refresh') {
+          await sleep(rnd(800, 1500));
+          const rl = curlCall(`search_p${p}_setloc${a + 1}`, SET_LOCATION_URL, setLocOpts());
+          say(`    set-location refresh: ${rl.status} bmsc=${jar.ak_bmsc ? 1 : 0}`);
+        }
         await sleep(6000 + Math.random() * 1000);
       }
+      result.page_recoveries.push(a);
       if (sr.status !== 200) { searchFail = { step: `search_p${p}`, status: sr.status }; break; }
       let json = {};
       try { json = JSON.parse(sr.body); } catch (_) {}
