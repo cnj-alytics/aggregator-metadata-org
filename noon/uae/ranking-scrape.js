@@ -3,6 +3,10 @@
 // MINT v4 (2026-11-01): 1-call mint (st whoami) with zone headers from noon_lab.mint_zone_cache via claim;
 //   swap-and-retry on blocked identity calls; no token refresh; area 2 skips set-location when cached.
 //   Cache miss → full 4-call mint with swap-and-retry. Lab-tested as noon-mint-lab/ranking-candidate.js.
+// HANDOVER (2026-11-01): a machine blocked on a page (after on_search_block.max_attempts swaps) saves a
+//   checkpoint (pages done, Noon's next-page searchToken, cards so far) via noon_ranking_checkpoint_save,
+//   reports blocked and shuts down. The next machine (new IP) gets the checkpoint from noon_ranking_claim
+//   and continues from that page. Noon's searchToken holds no device/session/IP data (verified 2026-11-01).
 //
 // One GitHub runner = one machine = one IP = one Noon guest session.
 // Dispatched by Supabase (noon_ranking_dispatch_machine) to either the
@@ -351,6 +355,19 @@ function failStep(step) {
 const DIRHAM_RE = //g;
 const cleanText = (s) => (typeof s === 'string' ? s.replace(DIRHAM_RE, 'AED').trim() || null : null);
 
+// HANDOVER: keep only the outlet fields parseCards / isRestaurant read, so checkpoints stay small.
+function trimOutlet(o) {
+  const pick = (x, keys) => (x && typeof x === 'object') ? Object.fromEntries(keys.filter((k) => x[k] !== undefined).map((k) => [k, x[k]])) : undefined;
+  const t = {};
+  for (const k of ['outletCode', 'operatingStatusCode', 'operatingType', 'tag', 'miniTag', 'extendedTag', 'widgetGroup',
+                   'isPersonalized', 'isNearAndQuick', 'name', 'linkUrl', 'cuisines', 'restaurantCode', 'price', 'distance',
+                   'isVip', 'vipMsg']) if (o[k] !== undefined) t[k] = o[k];
+  const rt = pick(o.rating, ['score', 'count', 'title', 'displayCount']); if (rt) t.rating = rt;
+  const d = pick(o.delivery, ['fee', 'originalFee', 'minOrder', 'time']); if (d) t.delivery = d;
+  const m = pick(o.media, ['heroImage', 'logoImage']); if (m) t.media = m;
+  return t;
+}
+
 function isRestaurant(outlet, nonFoodSet) {
   const cuisines = Array.isArray(outlet.cuisines) ? outlet.cuisines : [];
   if (cuisines.length === 0) return true;
@@ -589,6 +606,15 @@ function parseCards(outlets, nonFoodSet) {
     const seen = new Set();
     const captures = [];
 
+    // HANDOVER: resume from a checkpoint saved by a blocked machine (same run + area).
+    const cp = (claim.checkpoint && typeof claim.checkpoint === 'object') ? claim.checkpoint : null;
+    let resumedFrom = 0;
+    if (cp && Number(cp.pages_done) > 0 && cp.search_token && Array.isArray(cp.captures)) {
+      for (const o of cp.captures) if (o && o.outletCode && !seen.has(o.outletCode)) { seen.add(o.outletCode); captures.push(o); }
+      pagesDone = Number(cp.pages_done); searchToken = cp.search_token; resumedFrom = pagesDone;
+      say(`RESUME from checkpoint: page ${pagesDone + 1}, ${captures.length} cards carried over (handover #${cp.handovers || 1})`);
+    }
+
     const auditVisibility = () => ({
       rotations: AREA_LOG.rotations, recoveries: AREA_LOG.recoveries, recoveries_ok: AREA_LOG.recoveries_ok,
       remints: AREA_LOG.remints, search_403: AREA_LOG.search_403, search_429: AREA_LOG.search_429,
@@ -786,7 +812,18 @@ function parseCards(outlets, nonFoodSet) {
           await applyStrategy(strategies[attempt % strategies.length]);
         }
         if (sr.status === 404) { stopReason = `404@${pagesDone + 1}`; break; }
-        if (sr.status !== 200) throw Object.assign(new Error(`search ${sr.status}`), { step: 'search', status: sr.status });
+        if (sr.status !== 200) {
+          // HANDOVER: save where we are so the next machine (new IP) continues from this page.
+          if ((sr.status === 403 || sr.status === 429) && searchToken && pagesDone > 0) {
+            try {
+              const slim = captures.map(trimOutlet);
+              const cs = await rpc('noon_ranking_checkpoint_save', { p_run_id: RUN_ID, p_area_id: areaId, p_machine_no: MACHINE,
+                p_pages_done: pagesDone, p_search_token: searchToken, p_captures: slim });
+              say(`HANDOVER: blocked at page ${pagesDone + 1} after ${maxRec} swaps — checkpoint saved (${pagesDone} pages, ${slim.length} cards): ${JSON.stringify(cs)}`);
+            } catch (ce) { say(`HANDOVER checkpoint save failed: ${ce.message}`); }
+          }
+          throw Object.assign(new Error(`search ${sr.status}${pagesDone > 0 ? ` — handover at page ${pagesDone + 1}` : ''}`), { step: 'search', status: sr.status });
+        }
 
         let json;
         try { json = JSON.parse(sr.body); } catch (_) { stopReason = `bad-json@${pagesDone + 1}`; break; }
@@ -868,11 +905,11 @@ function parseCards(outlets, nonFoodSet) {
       req_before: reqBefore, req_area: NOON_REQ - reqBefore, elapsed_ms: elapsed,
       outcome: 'ok', pages: pagesDone, cards: captures.length,
       rows_parsed: parsed.rows.length, rows_saved: savedAnalysis,
-      stop_reason: `${stopReason} rot=${identityRotations - rotBefore} rec=${recoveryAttempts - recBefore} remints=${remintCount} pauses=${distractionPauses} gap=${PAGE_GAP_MS_MIN}-${PAGE_GAP_MS_MAX} imp=${IMPRESSIONS_PER_PAGE}`,
+      stop_reason: `${stopReason} rot=${identityRotations - rotBefore} rec=${recoveryAttempts - recBefore} remints=${remintCount} pauses=${distractionPauses} gap=${PAGE_GAP_MS_MIN}-${PAGE_GAP_MS_MAX} imp=${IMPRESSIONS_PER_PAGE} resumed_from=${resumedFrom}`,
       ...auditVisibility(), ...mintStats(),
     });
     totalAreas++; totalRows += parsed.rows.length; totalDropped += parsed.dropped;
-    say(`${areaName} ok: ${captures.length} cards, ${parsed.rows.length} rows (${parsed.dropped} non-food dropped), ${pagesDone}p, ${Math.round(elapsed / 1000)}s, recoveries=${recoveryAttempts - recBefore} | ${stopReason} | saved=${savedAnalysis} pending=${savedPending} -> ${rep && rep.action}`);
+    say(`${areaName} ok: ${captures.length} cards, ${parsed.rows.length} rows (${parsed.dropped} non-food dropped), ${pagesDone}p, ${Math.round(elapsed / 1000)}s, recoveries=${recoveryAttempts - recBefore} | ${stopReason}${resumedFrom ? ` (resumed from page ${resumedFrom + 1})` : ''} | saved=${savedAnalysis} pending=${savedPending} -> ${rep && rep.action}`);
 
     if (rep && rep.action === 'stop_job') { exitReason = 'stop_job'; break; }
     if (areaIdx === 0 && pagesDone >= EARLY_EXIT_PAGES) { say(`area 1 was ${pagesDone}p (>= ${EARLY_EXIT_PAGES}) — not claiming area 2`); exitReason = 'first_area_long'; break; }
