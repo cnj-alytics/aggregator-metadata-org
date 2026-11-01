@@ -94,8 +94,8 @@ function curlCall(step, url, { method = 'GET', headers = {}, body = null, cookie
   try {
     raw = execFileSync(CURL, args, { encoding: 'utf-8', timeout: 22000, maxBuffer: 20 * 1024 * 1024 });
   } catch (e) {
-    const err = String(e.message || e).slice(0, 300);
-    logReq({ step, st: null, ms: Date.now() - t0, err: err.slice(0, 120) });
+    const err = `exit=${e.status ?? '?'} ${String(e.stderr || e.message || e).replace(/\s+/g, ' ').trim()}`.slice(0, 300);
+    logReq({ step, st: null, ms: Date.now() - t0, err: err.slice(0, 200) });
     return { step, status: null, ms: Date.now() - t0, error: err };
   }
   const ms = Date.now() - t0;
