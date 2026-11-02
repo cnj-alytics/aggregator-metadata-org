@@ -7,6 +7,9 @@
 //   checkpoint (pages done, Noon's next-page searchToken, cards so far) via noon_ranking_checkpoint_save,
 //   reports blocked and shuts down. The next machine (new IP) gets the checkpoint from noon_ranking_claim
 //   and continues from that page. Noon's searchToken holds no device/session/IP data (verified 2026-11-01).
+// ROBUST (2026-11-02): Supabase calls retry for ~60s with backoff (and time out after 20s each) instead of
+//   crashing after 3 quick tries; a background heartbeat every 30s; a checkpoint is saved on ANY failed page
+//   (503 / no response too), not only on 403/429.
 //
 // One GitHub runner = one machine = one IP = one Noon guest session.
 // Dispatched by Supabase (noon_ranking_dispatch_machine) to either the
@@ -288,21 +291,30 @@ function impressionTripletsBatch(outlets, startIdx, v, i) {
 
 // -- Supabase -----------------------------------------------------------------
 
+// ROBUST: keep retrying a busy/unreachable database for ~60s (1,2,4,8,15,15,15s pauses) instead of
+// crashing after 3 quick tries. Each call times out after 20s so a stuck connection can't hang the machine.
+// A 4xx (except 408/429) is a real error in the request and is not retried.
 async function rpc(name, params) {
+  const pauses = [1000, 2000, 4000, 8000, 15000, 15000, 15000];
   for (let attempt = 1; ; attempt++) {
+    let status = null;
     try {
       const resp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${name}`, {
         method: 'POST',
         headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify(params),
+        signal: AbortSignal.timeout(20000),
       });
+      status = resp.status;
       const text = await resp.text();
       if (!resp.ok) throw new Error(`rpc(${name}) ${resp.status}: ${text.slice(0, 500)}`);
       return text ? JSON.parse(text) : null;
     } catch (e) {
-      if (attempt >= 3) throw e;
-      say(`rpc(${name}) attempt ${attempt} failed: ${e.message} - retrying`);
-      await sleep(2000 * attempt);
+      const permanent = status != null && status >= 400 && status < 500 && status !== 408 && status !== 429;
+      if (permanent || attempt > pauses.length) throw e;
+      say(`rpc(${name}) attempt ${attempt} failed: ${e.message.slice(0, 160)} - retrying in ${pauses[attempt - 1] / 1000}s`);
+      heartbeat(true);
+      await sleep(pauses[attempt - 1] + Math.random() * 500);
     }
   }
 }
@@ -480,6 +492,8 @@ function parseCards(outlets, nonFoodSet) {
 
   const start = await rpc('noon_ranking_machine_start', { p_run_id: RUN_ID, p_machine_no: MACHINE, p_github_run_id: GH_RUN_ID });
   if (!start || start.stop || start.error) { say(`told to stop at check-in: ${JSON.stringify(start)}`); return; }
+  // ROBUST: background heartbeat every 30s, whatever the machine is doing (unref: never keeps the process alive).
+  setInterval(() => heartbeat(true), 30000).unref();
   const scrapeDate = start.scrape_date, scrapeHour = start.scrape_hour, dryRun = !!start.dry_run;
 
   // Spec -> session-level values (v3 verbatim resolution)
@@ -814,12 +828,12 @@ function parseCards(outlets, nonFoodSet) {
         if (sr.status === 404) { stopReason = `404@${pagesDone + 1}`; break; }
         if (sr.status !== 200) {
           // HANDOVER: save where we are so the next machine (new IP) continues from this page.
-          if ((sr.status === 403 || sr.status === 429) && searchToken && pagesDone > 0) {
+          if (searchToken && pagesDone > 0) {  // ROBUST: checkpoint on ANY failed page (403/429/503/no response)
             try {
               const slim = captures.map(trimOutlet);
               const cs = await rpc('noon_ranking_checkpoint_save', { p_run_id: RUN_ID, p_area_id: areaId, p_machine_no: MACHINE,
                 p_pages_done: pagesDone, p_search_token: searchToken, p_captures: slim });
-              say(`HANDOVER: blocked at page ${pagesDone + 1} after ${maxRec} swaps — checkpoint saved (${pagesDone} pages, ${slim.length} cards): ${JSON.stringify(cs)}`);
+              say(`HANDOVER: page ${pagesDone + 1} failed (${sr.status}) — checkpoint saved (${pagesDone} pages, ${slim.length} cards): ${JSON.stringify(cs)}`);
             } catch (ce) { say(`HANDOVER checkpoint save failed: ${ce.message}`); }
           }
           throw Object.assign(new Error(`search ${sr.status}${pagesDone > 0 ? ` — handover at page ${pagesDone + 1}` : ''}`), { step: 'search', status: sr.status });
