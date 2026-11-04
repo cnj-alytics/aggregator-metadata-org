@@ -10,6 +10,10 @@
 // ROBUST (2026-11-02): Supabase calls retry for ~60s with backoff (and time out after 20s each) instead of
 //   crashing after 3 quick tries; a background heartbeat every 30s; a checkpoint is saved on ANY failed page
 //   (503 / no response too), not only on 403/429.
+// RANDOMISED (2026-11-04): Supabase (noon_ranking_machine_start) gives each machine a random launch wait
+//   (starting machines go out in random batches at random gaps) and a random session style:
+//   whoami (1-call mint) | whoami_setloc (1-call mint + set-location) | full (4-call mint, ignores zone cache).
+//   noon_ranking_claim returns lat/lng shifted 20-100 m inside the area (tested: rankings unchanged).
 //
 // One GitHub runner = one machine = one IP = one Noon guest session.
 // Dispatched by Supabase (noon_ranking_dispatch_machine) to either the
@@ -494,6 +498,11 @@ function parseCards(outlets, nonFoodSet) {
   if (!start || start.stop || start.error) { say(`told to stop at check-in: ${JSON.stringify(start)}`); return; }
   // ROBUST: background heartbeat every 30s, whatever the machine is doing (unref: never keeps the process alive).
   setInterval(() => heartbeat(true), 30000).unref();
+  // RANDOMISED: per-machine session style and launch wait chosen by Supabase.
+  const SESSION_STYLE = ['whoami', 'whoami_setloc', 'full'].includes(start.session_style) ? start.session_style : 'whoami';
+  const launchWait = Math.max(0, Math.min(Number(start.launch_wait_s) || 0, 900));
+  say(`session style=${SESSION_STYLE} | launch wait ${launchWait}s`);
+  if (launchWait > 0) await sleep(launchWait * 1000);
   const scrapeDate = start.scrape_date, scrapeHour = start.scrape_hour, dryRun = !!start.dry_run;
 
   // Spec -> session-level values (v3 verbatim resolution)
@@ -602,7 +611,7 @@ function parseCards(outlets, nonFoodSet) {
 
     const areaStart = Date.now();
     AREA_LOG = newAreaLog();
-    const zoneCached = !!(claim.zone_headers && typeof claim.zone_headers === 'object' && Object.keys(claim.zone_headers).length);
+    const zoneCached = SESSION_STYLE !== 'full' && !!(claim.zone_headers && typeof claim.zone_headers === 'object' && Object.keys(claim.zone_headers).length);
     let harvestedZone = null;
     const swapsBefore = mintSwaps;
     const mintStats = () => {
@@ -716,6 +725,17 @@ function parseCards(outlets, nonFoodSet) {
           whoHeaders = { ...claim.zone_headers };
           lastMintAt = Date.now();
           say(`MINT done (1 call): nguestv2 set, zone=${whoHeaders['x-food-zonecode'] || '-'} in ${Math.round((Date.now() - areaStart) / 1000)}s`);
+          if (SESSION_STYLE === 'whoami_setloc') {
+            // RANDOMISED style: also set the delivery location, like the app does after launch.
+            await sleep(1200 + Math.random() * 800);
+            const rl = await mintCall('mint_set_location', SET_LOCATION_URL, () => ({
+              method: 'POST',
+              headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae', 'x-device-lat': String(lat), 'x-device-lng': String(lng), 'Content-Type': 'application/json' },
+              body: JSON.stringify({ location: { lat, lng }, lang: 'en' }), cookieJar: jar }));
+            if (rl.status !== 200) throw mintFail(rl);
+            await sleep(200 + Math.random() * 300);
+            et('et_mint_location', [evLocationFetch(visitorId, deviceIdfv), evPageHome(visitorId, deviceIdfv)]);
+          }
         } else {
 
         await sleep(1200 + Math.random() * 800);
@@ -750,8 +770,16 @@ function parseCards(outlets, nonFoodSet) {
       } else if (zoneCached) {
         // CANDIDATE: same session, new location — no identity call, no refresh.
         whoHeaders = { ...claim.zone_headers };
-        say(`AREA TRANSITION (no set-location): device=${shortId(deviceId)} zone=${whoHeaders['x-food-zonecode'] || '-'} token age ${Math.round((Date.now() - lastMintAt) / 1000)}s`);
+        say(`AREA TRANSITION (${SESSION_STYLE === 'whoami_setloc' ? 'with' : 'no'} set-location): device=${shortId(deviceId)} zone=${whoHeaders['x-food-zonecode'] || '-'} token age ${Math.round((Date.now() - lastMintAt) / 1000)}s`);
         await sleep(800 + Math.random() * 700);
+        if (SESSION_STYLE === 'whoami_setloc') {
+          const rl = await mintCall('area_set_location', SET_LOCATION_URL, () => ({
+            method: 'POST',
+            headers: { ...base(), 'x-experience': 'ecom', 'x-locale': 'en-ae', 'x-device-lat': String(lat), 'x-device-lng': String(lng), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ location: { lat, lng }, lang: 'en' }), cookieJar: jar }));
+          if (rl.status !== 200) throw mintFail(rl);
+          await sleep(200 + Math.random() * 300);
+        }
         et('et_area_transition', [evLocationFetch(visitorId, deviceIdfv)]);
       } else {
         say(`AREA TRANSITION: same session, device=${shortId(deviceId)} visitor=${shortId(visitorId)}, token age ${Math.round((Date.now() - lastMintAt) / 1000)}s`);
