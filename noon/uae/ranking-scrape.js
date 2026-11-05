@@ -213,8 +213,21 @@ function mergeSpec(defaults, spec) {
 
 // -- Noon constants (v3) ------------------------------------------------------
 
-const UA = 'noon/22895 CFNetwork/3896.100.1.2.1 Darwin/27.0.0';
-const BUILD = '22895';
+// APP VERSION (2026-11-05): build / app version / User-Agent come from Supabase
+// noon_ranking_settings.scrape_spec.app — update them there when the Noon app updates.
+// These are only the fallback if Supabase has no (or an invalid) value.
+const APP_DEFAULT = { build: '23440', version: '5.261104', ua_tail: 'CFNetwork/3896.100.1.2.1 Darwin/27.0.0' };
+let UA = `noon/${APP_DEFAULT.build} ${APP_DEFAULT.ua_tail}`;
+let BUILD = APP_DEFAULT.build;
+function applyAppIdentity(app) {
+  const a = (app && typeof app === 'object') ? app : {};
+  const build = /^[0-9]{4,7}$/.test(String(a.build ?? '')) ? String(a.build) : APP_DEFAULT.build;
+  const version = /^[0-9]{1,3}(\.[0-9]{1,8}){1,3}$/.test(String(a.version ?? '')) ? String(a.version) : APP_DEFAULT.version;
+  const tail = /^[A-Za-z0-9 ./_()-]{1,80}$/.test(String(a.ua_tail ?? '')) ? String(a.ua_tail) : APP_DEFAULT.ua_tail;
+  BUILD = build; UA = `noon/${build} ${tail}`;
+  NOON_APP.ab = build; NOON_APP.av = version; FOOD_APP.ab = build; FOOD_APP.av = version;
+  return { build, version, ua: UA };
+}
 const WHOAMI_URL = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami';
 const WHOAMI_FOOD_URL = 'https://api-app-st.noon.com/_vs/st/st-whoami-api/whoami?experience=food&select_nearby=1';
 const SET_LOCATION_URL = 'https://api-app.noon.com/_vs/st/mp-identity-api-geo/serviceable-geo-info/set-location-by-lat-lng';
@@ -231,8 +244,8 @@ function deviceBlock(idfv) {
 function evt(ev, em, visitorId, idfv) {
   return { em, ev, ts: Date.now(), pc: 'noon', vid: visitorId, lo: 'en-ae', pf: 'ios', d: deviceBlock(idfv) };
 }
-const NOON_APP = { mc: 'noon', an: 'noon', av: '5.261024', ab: '22895', mpe: 'noon' };
-const FOOD_APP = { mc: 'food', an: 'noon', av: '5.261024', ab: '22895', mpe: 'food' };
+const NOON_APP = { mc: 'noon', an: 'noon', av: APP_DEFAULT.version, ab: APP_DEFAULT.build, mpe: 'noon' };
+const FOOD_APP = { mc: 'food', an: 'noon', av: APP_DEFAULT.version, ab: APP_DEFAULT.build, mpe: 'food' };
 
 function evLaunch(v, i) {
   return evt('launch', { fsv: '1.00', isNA: false, nps: 'denied',
@@ -508,6 +521,8 @@ function parseCards(outlets, nonFoodSet) {
   // Spec -> session-level values (v3 verbatim resolution)
   const SPEC = mergeSpec(DEFAULT_SPEC, await rpc('noon_ranking_scrape_spec', {}));
   MAX_AREAS = Number(SPEC.max_areas ?? 2);
+  const APP_ID = applyAppIdentity(SPEC.app);
+  say(`app identity: build=${APP_ID.build} version=${APP_ID.version} ua="${APP_ID.ua}"`);
   const EARLY_EXIT_PAGES = Number(SPEC.early_exit_pages ?? 50);
   let PAGE_GAP_MS_MIN, PAGE_GAP_MS_MAX;
   if (SPEC.pacing.session_randomize) {
