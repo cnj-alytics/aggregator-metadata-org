@@ -1,0 +1,40 @@
+name: Noon UAE – FP lab (transport / TLS fingerprint experiment)
+run-name: fp lab t${{ inputs.test_id }} m${{ inputs.machine_no }}
+
+# LAB ONLY — not production. Dispatched by Supabase noon_lab.mint_dispatch()
+# when the test's workflow_file is noon-fp-lab.yml. Runs noon-mint-lab/fp-lab.py.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_id:
+        description: 'noon_lab.mint_test.test_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'noon_lab.mint_machine.machine_no'
+        required: true
+        type: string
+
+jobs:
+  fp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    name: fp lab t${{ inputs.test_id }} m${{ inputs.machine_no }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: noon-mint-lab
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -q curl_cffi==0.17.0
+      - name: FP lab attempt
+        working-directory: noon-mint-lab
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TEST_ID: ${{ inputs.test_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: python fp-lab.py
