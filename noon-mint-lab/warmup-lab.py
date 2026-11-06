@@ -66,7 +66,9 @@ def main():
     WARMUP = spec.get('warmup', 'none')
     PACING = spec.get('pre_mint_pacing', 'fast')
     CHATTER = bool(spec.get('pre_search_chatter'))
-    PROXY = spec.get('proxy')  # e.g. "http://user:pass@host:port" — routes all Noon calls through it
+    # Proxy source: env var NOON_PROXY_URL (from GitHub secret) wins; falls back to spec.proxy.
+    # When the env var is set, routing all Noon calls through it; the auth part of the URL is not logged.
+    PROXY = os.environ.get('NOON_PROXY_URL') or spec.get('proxy')
     if PROXY: say(f"using proxy: {PROXY.split('@')[-1] if '@' in PROXY else PROXY}")
     APPH = bool(spec.get('app_headers', True))
     lat, lng = float(claim['lat']), float(claim['lng'])
