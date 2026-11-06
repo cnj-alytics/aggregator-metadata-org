@@ -122,6 +122,20 @@ def heartbeat_loop():
         time.sleep(30)
         rest_patch('noon_ranking_run_machine', f'run_id=eq.{RUN_ID}&machine_no=eq.{MACHINE}', {'last_seen_at': now_iso()})
 
+def permit(penalty_s=0):
+    """Per-IP page budget (Supabase noon_ranking_fb_page_permit): seconds to wait before the next Noon page.
+    penalty_s > 0 after a 429: every machine on this IP backs off that long. Never blocks scraping on a DB hiccup."""
+    try:
+        r = cr.post(f'{SUPABASE_URL}/rest/v1/rpc/noon_ranking_fb_page_permit', timeout=8,
+                    json={'p_run_id': RUN_ID, 'p_machine_no': MACHINE, 'p_penalty_s': int(penalty_s)},
+                    headers={'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}', 'Content-Type': 'application/json'})
+        if r.status_code < 300:
+            return max(0, int((r.json() or {}).get('wait_ms') or 0)) / 1000.0
+        say(f'permit HTTP {r.status_code}')
+    except Exception as e:
+        say(f'permit failed: {str(e)[:100]}')
+    return float(penalty_s)
+
 RUNNER_IP = None
 def audit(row):
     body = {'run_id': RUN_ID, 'machine_no': MACHINE, 'github_run_id': GH_RUN_ID, 'runner_ip': RUNNER_IP,
@@ -342,6 +356,23 @@ def scrape_area(claim, ctx):
     stop_reason, search_403, search_429, et_posts, et_events, et_non2xx = None, 0, 0, 0, 0, 0
     mint_calls, mint_403 = 0, 0
     resumed_from = 0
+    state = {'minted_at': None, 'refresh_at': 240.0, 'paused': False, 'refreshes': 0}
+
+    def new_refresh_at():  # guest token lives 300 s: refresh at a random point in the window (default 200-240 s)
+        lo, hi = float(claim.get('refresh_min_s') or 200), float(claim.get('refresh_max_s') or 240)
+        return lo + random.random() * max(0.0, hi - lo)
+
+    def send429(step, url, headers_fn, method='GET', body=None):
+        """One 30 s pause per area on a 429 (the whole IP backs off via Supabase), then one retry."""
+        st, txt = c.send(step, url, headers_fn(), method=method, body=body)
+        if st == 429 and not state['paused']:
+            state['paused'] = True
+            w = permit(int(claim.get('pause_429_s') or 30))
+            say(f'429 at {step}: pausing {w:.0f}s (whole IP) then one retry')
+            time.sleep(w + random.random() * 3)
+            st, txt = c.send(f'{step}_after429', url, headers_fn(), method=method, body=body)
+            say(f'  after pause: {step} -> {st}')
+        return st, txt
 
     say(f"=== AREA {area_name} id={area_id} | persona={ctx['persona']} | dev={c.dev[:8]} ===")
     cp = claim.get('checkpoint') if isinstance(claim.get('checkpoint'), dict) else None
@@ -389,7 +420,7 @@ def scrape_area(claim, ctx):
             'stop_reason': (f"{stop_reason} fleet={FLEET}{':' + PROXY_PORT if PROXY_PORT else ''} persona={ctx['persona']} "
                             f"pace={ctx['pace'][0]}-{ctx['pace'][1]}s resumed_from={resumed_from}") if kind == 'ok' else
                            f"fallback fleet={FLEET}{':' + PROXY_PORT if PROXY_PORT else ''} persona={ctx['persona']}",
-            'rotations': 0, 'recoveries': 0, 'recoveries_ok': 0, 'remints': 0,
+            'rotations': 0, 'recoveries': 1 if state['paused'] else 0, 'recoveries_ok': 0, 'remints': state['refreshes'],
             'search_403': search_403, 'search_429': search_429, 'et_posts': et_posts, 'et_events': et_events, 'et_non2xx': et_non2xx,
             'device_id_start': c.dev[:8], 'device_id_end': c.dev[:8], 'req_log': c.log,
             'zone_cached': zone_cached, 'mint_calls': mint_calls, 'mint_403': mint_403, 'mint_swaps': 0,
@@ -407,11 +438,13 @@ def scrape_area(claim, ctx):
         time.sleep(1.8 + random.random() * 0.6)
 
         # --- mint: whoami ---
-        st, _ = c.send('mint_whoami', WHOAMI_URL, c.base({'x-whoami-request-id': str(uuid.uuid4())}))
+        time.sleep(permit())
+        st, _ = send429('mint_whoami', WHOAMI_URL, lambda: c.base({'x-whoami-request-id': str(uuid.uuid4())}))
         mint_calls += 1
         if st != 200:
             mint_403 += 1 if st in (403, 429) else 0
             return finish(kind_of(st), st, 'mint_whoami', f'mint_whoami {st} (sentry={sentry})')
+        state['minted_at'] = time.time(); state['refresh_at'] = new_refresh_at()
         time.sleep(1.8 + random.random() * 0.6)
         st, _ = c.send('etracker_track', ETRACKER_TRACK, {'User-Agent': UA, 'Content-Type': 'application/json', 'Accept': '*/*'},
                        method='POST', body=json.dumps([{'em': {'app': 'noon', 'v': 1}, 'ev': 'launch',
@@ -421,8 +454,8 @@ def scrape_area(claim, ctx):
 
         # --- set-location ---
         loc_h = {'x-experience': 'ecom', 'x-locale': 'en-ae', 'x-device-lat': str(lat), 'x-device-lng': str(lng), 'Content-Type': 'application/json'}
-        st, _ = c.send('mint_set_location', SET_LOC_URL, c.base(loc_h), method='POST',
-                       body=json.dumps({'location': {'lat': lat, 'lng': lng}, 'lang': 'en'}))
+        st, _ = send429('mint_set_location', SET_LOC_URL, lambda: c.base(loc_h), method='POST',
+                        body=json.dumps({'location': {'lat': lat, 'lng': lng}, 'lang': 'en'}))
         mint_calls += 1
         if st != 200:
             mint_403 += 1 if st in (403, 429) else 0
@@ -433,7 +466,7 @@ def scrape_area(claim, ctx):
             time.sleep(0.8 + random.random() * 0.6)
             fd_h = {'x-experience': 'food', 'x-locale': 'en-ae', 'x-device-lat': str(lat), 'x-device-lng': str(lng),
                     'x-mp-country': 'ae', 'x-lat': str(round(lat * 1e7)), 'x-lng': str(round(lng * 1e7))}
-            st, txt = c.send('mint_fd_whoami', FD_WHOAMI_URL, c.base(fd_h))
+            st, txt = send429('mint_fd_whoami', FD_WHOAMI_URL, lambda: c.base(fd_h))
             mint_calls += 1
             if st != 200:
                 mint_403 += 1 if st in (403, 429) else 0
@@ -448,9 +481,16 @@ def scrape_area(claim, ctx):
         # --- pagination (persona pace; production stop rules) ---
         first_page = True
         while pages_done < max_pages:
-            if not first_page:  # persona gap between pages (the first page follows the warm-up pause)
-                time.sleep(ctx['pace'][0] + random.random() * max(0.0, ctx['pace'][1] - ctx['pace'][0]))
+            gap = 0.0 if first_page else ctx['pace'][0] + random.random() * max(0.0, ctx['pace'][1] - ctx['pace'][0])
             first_page = False
+            time.sleep(max(gap, permit()))  # persona pace, but never faster than this IP's page budget
+            if time.time() - state['minted_at'] >= state['refresh_at']:  # refresh before the 300 s token expiry
+                st, _ = send429('token_refresh', WHOAMI_URL, lambda: c.base({'x-whoami-request-id': str(uuid.uuid4())}))
+                if st != 200:
+                    return finish(kind_of(st), st, 'token_refresh', f'token refresh {st} at page {pages_done + 1}', pages_done + 1)
+                state['minted_at'] = time.time(); state['refresh_at'] = new_refresh_at(); state['refreshes'] += 1
+                time.sleep(0.6 + random.random() * 1.2)
+                time.sleep(permit())
             body = {'queryEntity': None, 'q': None, 'f': {}, 'contexts': [], 'withContent': True, 'excludeOutletCodes': [],
                     'limit': 60, 'scopes': None, 'page': 1, 'dishTags': [], 'ratingMin': None,
                     'sort': {'by': 'popularity', 'dir': 'desc', 'slab': None}, 'widgets': None, 'content': None,
@@ -466,7 +506,7 @@ def scrape_area(claim, ctx):
                 if v is not None and not isinstance(v, (dict, list)):
                     sh[k] = str(v).lower() if isinstance(v, bool) else str(v)
             sh['x-ab-test'] = AB_TEST
-            st, txt = c.send('search', SEARCH_URL, c.base(sh), method='POST', body=json.dumps(body))
+            st, txt = send429('search', SEARCH_URL, lambda: c.base(sh), method='POST', body=json.dumps(body))
             if st in (None, 502, 503, 504):  # one patient retry on a flaky response
                 time.sleep(3 + random.random() * 2)
                 st, txt = c.send('search_retry1', SEARCH_URL, c.base(sh), method='POST', body=json.dumps(body))
