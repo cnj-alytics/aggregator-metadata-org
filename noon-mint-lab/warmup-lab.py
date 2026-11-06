@@ -72,8 +72,20 @@ def main():
     PROXY_SCOPE = spec.get('proxy_scope', 'all')  # "all" or "mint_only" (search goes direct from the runner)
     if PROXY: say(f"using proxy: {PROXY.split('@')[-1] if '@' in PROXY else PROXY} (scope={PROXY_SCOPE})")
     APPH = bool(spec.get('app_headers', True))
-    SEARCH_GAP_MIN = float(spec.get('search_gap_min_s', 1.5))
-    SEARCH_GAP_MAX = float(spec.get('search_gap_max_s', 4.5))
+    # Per-machine pacing profile: "fixed" uses the search_gap_min/max from spec.
+    # "varied_human" picks one of three personas at startup — each machine looks like
+    # a different kind of cafe customer, so aggregate rate stays natural without
+    # 20 machines all running on the same drumbeat.
+    PACING_PROFILE = spec.get('pacing_profile', 'fixed')
+    if PACING_PROFILE == 'varied_human':
+        persona = random.choices(['scroller', 'browser', 'reader'], weights=[25, 55, 20])[0]
+        PERSONA_PACES = {'scroller': (2.0, 6.0), 'browser': (6.0, 15.0), 'reader': (15.0, 30.0)}
+        SEARCH_GAP_MIN, SEARCH_GAP_MAX = PERSONA_PACES[persona]
+        say(f"persona: {persona} (page gap {SEARCH_GAP_MIN}-{SEARCH_GAP_MAX}s)")
+    else:
+        persona = 'fixed'
+        SEARCH_GAP_MIN = float(spec.get('search_gap_min_s', 1.5))
+        SEARCH_GAP_MAX = float(spec.get('search_gap_max_s', 4.5))
     lat, lng = float(claim['lat']), float(claim['lng'])
     pages = int(claim.get('search_pages') or 10)
     zone = dict(claim.get('zone_headers') or {})
@@ -224,7 +236,7 @@ def main():
     res['search_403'] = search_403; res['search_other'] = search_other
     res['page1_outlets'] = p1_outlets; res['page1_codes'] = p1_codes
     res['swaps'] = 0  # not applicable in this lab
-    res['recovery'] = f'warmup={WARMUP}|pacing={PACING}|chatter={int(CHATTER)}|imp={IMP}'
+    res['recovery'] = f'warmup={WARMUP}|pacing={PACING}|persona={persona}|chatter={int(CHATTER)}|imp={IMP}'
     finish(claim, res, log)
 
 def finish(claim, res, log):
