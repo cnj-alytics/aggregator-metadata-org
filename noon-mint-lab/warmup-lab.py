@@ -71,6 +71,8 @@ def main():
     PROXY = os.environ.get('NOON_PROXY_URL') or spec.get('proxy')
     if PROXY: say(f"using proxy: {PROXY.split('@')[-1] if '@' in PROXY else PROXY}")
     APPH = bool(spec.get('app_headers', True))
+    SEARCH_GAP_MIN = float(spec.get('search_gap_min_s', 1.5))
+    SEARCH_GAP_MAX = float(spec.get('search_gap_max_s', 4.5))
     lat, lng = float(claim['lat']), float(claim['lng'])
     pages = int(claim.get('search_pages') or 10)
     zone = dict(claim.get('zone_headers') or {})
@@ -172,7 +174,7 @@ def main():
     if PACING == 'natural': time.sleep(1.0 + random.random() * 1.0)
     tok = None; search_ok = 0; search_tried = 0; search_403 = 0; search_other = 0; p1_outlets = 0; p1_codes = []
     for p in range(1, pages + 1):
-        if p > 1: time.sleep(1.5 + random.random() * 3.0)
+        if p > 1: time.sleep(SEARCH_GAP_MIN + random.random() * max(0.0, SEARCH_GAP_MAX - SEARCH_GAP_MIN))
         body = {'queryEntity': None, 'q': None, 'f': {}, 'contexts': [], 'withContent': True, 'excludeOutletCodes': [],
                 'limit': 60, 'scopes': None, 'page': 1, 'dishTags': [], 'ratingMin': None,
                 'sort': {'by': 'popularity', 'dir': 'desc', 'slab': None}, 'widgets': None, 'content': None,
