@@ -424,7 +424,9 @@ def scrape_area(claim, ctx):
     stop_reason, search_403, search_429, et_posts, et_events, et_non2xx = None, 0, 0, 0, 0, 0
     mint_calls, mint_403 = 0, 0
     resumed_from = 0
-    state = {'minted_at': None, 'refresh_at': 280.0, 'paused': False, 'refreshes': 0, 'remints': 0}
+    state = {'minted_at': None, 'refresh_at': 280.0, 'paused': False, 'refreshes': 0, 'remints': 0,
+             'remints_429': 0, 'remint429_ok': 0, 'after_remint429': []}
+    on_429 = str(claim.get('on_429') or 'pause')  # Supabase: 'remint' = new device + new token on a search 429
     dev_start = c.dev
     imp_n = int(ctx.get('impressions_per_page') or 6)
 
@@ -444,6 +446,8 @@ def scrape_area(claim, ctx):
     def send429(step, url, headers_fn, method='GET', body=None):
         """One 30 s pause per area on a 429 (the whole IP backs off via Supabase), then one retry."""
         st, txt = c.send(step, url, headers_fn(), method=method, body=body)
+        if st == 429 and step == 'search' and on_429 == 'remint':
+            return st, txt  # the caller swaps to a new device + new token instead of pausing
         if st == 429 and not state['paused']:
             state['paused'] = True
             w = permit(int(claim.get('pause_429_s') or 30))
@@ -507,8 +511,10 @@ def scrape_area(claim, ctx):
             'rows_saved': saved if kind == 'ok' else None,
             'fail_step': step, 'fail_page': fail_page, 'http_status': status, 'error': (err or '')[:300] or None,
             'stop_reason': (f"{stop_reason} fleet={FLEET}{':' + PROXY_PORT if PROXY_PORT else ''} persona={ctx['persona']} "
-                            f"pace={ctx['pace'][0]}-{ctx['pace'][1]}s resumed_from={resumed_from}") if kind == 'ok' else
-                           f"fallback fleet={FLEET}{':' + PROXY_PORT if PROXY_PORT else ''} persona={ctx['persona']}",
+                            f"pace={ctx['pace'][0]}-{ctx['pace'][1]}s resumed_from={resumed_from}"
+                            f" r429={state['remints_429']} r429_ok={state['remint429_ok']} after={state['after_remint429']}") if kind == 'ok' else
+                           f"fallback fleet={FLEET}{':' + PROXY_PORT if PROXY_PORT else ''} persona={ctx['persona']}"
+                           f" r429={state['remints_429']} r429_ok={state['remint429_ok']} after={state['after_remint429']}",
             'rotations': state['remints'], 'recoveries': 1 if state['paused'] else 0, 'recoveries_ok': state.get('remint_ok', 0),
             'remints': state['refreshes'],
             'search_403': search_403, 'search_429': search_429, 'et_posts': c.et_posts, 'et_events': c.et_events, 'et_non2xx': c.et_non2xx,
@@ -631,11 +637,29 @@ def scrape_area(claim, ctx):
                 st, txt = c.send('search_retry1', SEARCH_URL, c.base(sh), method='POST', body=json.dumps(body))
             if st == 403: search_403 += 1
             if st == 429: search_429 += 1
+            if state.pop('await_429_result', False):
+                state['after_remint429'].append(st)  # what the first search on the new device returned
+                if st == 200: state['remint429_ok'] += 1
             if st == 403:  # new token (fresh phone session), then retry this same page from the saved search token
                 rst, _ = remint_after_403(f'search p{pages_done + 1}')
                 if rst == 200:
                     first_page = True
                     continue
+            if st == 429 and on_429 == 'remint' and state['remints_429'] < int(claim.get('remints_429') or 3):
+                # 429: switch to a brand-new device id / visitor / cookies and mint a new token, then retry this page
+                state['remints_429'] += 1
+                old = c.dev[:8]
+                c.new_identity()
+                say(f'429 at search p{pages_done + 1}: new device + new token #{state["remints_429"]} ({old} -> {c.dev[:8]})')
+                time.sleep(2 + random.random() * 3)
+                mst, mstep = mint(f'r429_{state["remints_429"]}_')
+                if mst == 403:
+                    mst, mstep = remint_after_403(mstep)
+                if mst != 200:
+                    return finish(kind_of(mst), mst, mstep, f'mint after 429 failed: {mstep} {mst}', pages_done + 1)
+                state['await_429_result'] = True
+                first_page = True
+                continue
             if st == 404: stop_reason = f'404@{pages_done + 1}'; break
             if st != 200:
                 return finish(kind_of(st), st, 'search', f'search {st} at page {pages_done + 1}', pages_done + 1)
