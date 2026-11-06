@@ -68,9 +68,14 @@ def main():
     CHATTER = bool(spec.get('pre_search_chatter'))
     # Proxy source: env var NOON_PROXY_URL (from GitHub secret) wins; falls back to spec.proxy.
     # When the env var is set, routing all Noon calls through it; the auth part of the URL is not logged.
-    PROXY = os.environ.get('NOON_PROXY_URL') or spec.get('proxy')
+    # NOON_PROXY_URL may be a single URL OR a comma-separated list. Each machine picks one at random
+    # so when multiple IPs are available the load spreads naturally — no coordination needed.
+    PROXY_RAW = os.environ.get('NOON_PROXY_URL') or spec.get('proxy') or ''
+    PROXY_LIST = [u.strip() for u in PROXY_RAW.split(',') if u.strip()]
+    PROXY = random.choice(PROXY_LIST) if PROXY_LIST else None
     PROXY_SCOPE = spec.get('proxy_scope', 'all')  # "all" or "mint_only" (search goes direct from the runner)
-    if PROXY: say(f"using proxy: {PROXY.split('@')[-1] if '@' in PROXY else PROXY} (scope={PROXY_SCOPE})")
+    if PROXY:
+        say(f"using proxy: {PROXY.split('@')[-1] if '@' in PROXY else PROXY} (scope={PROXY_SCOPE}, pool_size={len(PROXY_LIST)})")
     APPH = bool(spec.get('app_headers', True))
     # Per-machine pacing profile: "fixed" uses the search_gap_min/max from spec.
     # "varied_human" picks one of three personas at startup — each machine looks like
