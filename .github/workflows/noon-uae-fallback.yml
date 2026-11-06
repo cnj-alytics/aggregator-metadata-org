@@ -1,0 +1,65 @@
+name: Noon UAE – Ranking fallback (UAE IP / Decodo)
+
+# PRODUCTION fallback fleet. Dispatched ONLY by Supabase (noon_ranking_fb_dispatch_one)
+# when the decoy fleet (noon-uae-ranking-scrape.yml) is being blocked, or when fallback
+# is forced on for an hour. Every Noon request goes through the proxy for this fleet;
+# the worker refuses to run if that proxy is missing or unreachable.
+#   fleet=uae    -> secret NOON_PROXY_URL         (Dubai VPS)
+#   fleet=decodo -> secret NOON_PROXY_URL_DECODO  (3 residential IPs; proxy_port picks one)
+# Only the secret for this machine's fleet is passed in.
+
+run-name: fallback run ${{ inputs.run_id }} m${{ inputs.machine_no }} ${{ inputs.fleet }} ${{ inputs.proxy_port }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'noon_ranking_run.run_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'machine_no inside the run'
+        required: true
+        type: string
+      fleet:
+        description: 'uae | decodo'
+        required: true
+        type: string
+      proxy_port:
+        description: 'Decodo port (decodo fleet only)'
+        required: false
+        type: string
+
+concurrency:
+  group: noon-uae-fallback-${{ inputs.run_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    name: fallback run ${{ inputs.run_id }} machine ${{ inputs.machine_no }} (${{ inputs.fleet }} ${{ inputs.proxy_port }})
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: noon/uae/fallback
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install -q curl_cffi==0.17.0
+
+      - name: Fallback scrape
+        working-directory: noon/uae/fallback
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_ID: ${{ inputs.run_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          FLEET: ${{ inputs.fleet }}
+          PROXY_PORT: ${{ inputs.proxy_port }}
+          NOON_PROXY_URL: ${{ inputs.fleet == 'decodo' && secrets.NOON_PROXY_URL_DECODO || secrets.NOON_PROXY_URL }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          WALL_LIMIT_SEC: '4000'
+        run: python -u fallback-worker.py
