@@ -69,7 +69,8 @@ def main():
     # Proxy source: env var NOON_PROXY_URL (from GitHub secret) wins; falls back to spec.proxy.
     # When the env var is set, routing all Noon calls through it; the auth part of the URL is not logged.
     PROXY = os.environ.get('NOON_PROXY_URL') or spec.get('proxy')
-    if PROXY: say(f"using proxy: {PROXY.split('@')[-1] if '@' in PROXY else PROXY}")
+    PROXY_SCOPE = spec.get('proxy_scope', 'all')  # "all" or "mint_only" (search goes direct from the runner)
+    if PROXY: say(f"using proxy: {PROXY.split('@')[-1] if '@' in PROXY else PROXY} (scope={PROXY_SCOPE})")
     APPH = bool(spec.get('app_headers', True))
     SEARCH_GAP_MIN = float(spec.get('search_gap_min_s', 1.5))
     SEARCH_GAP_MAX = float(spec.get('search_gap_max_s', 4.5))
@@ -93,7 +94,11 @@ def main():
         if jar: h['Cookie'] = '; '.join(f'{k}={v}' for k, v in jar.items())
         st0 = time.time()
         try:
-            kw = {'proxies': {'http': PROXY, 'https': PROXY}, 'verify': False} if PROXY else {}
+            # Decide whether to proxy THIS request:
+            #   scope "all"        → proxy every request
+            #   scope "mint_only"  → proxy only mint / warmup / set_location; search goes direct from the runner
+            use_proxy = bool(PROXY) and (PROXY_SCOPE != 'mint_only' or not step.startswith('search'))
+            kw = {'proxies': {'http': PROXY, 'https': PROXY}, 'verify': False} if use_proxy else {}
             r = s.request(method, url, headers=h, data=body, timeout=30, **kw)
             st, txt = r.status_code, r.text
             for k, v in r.cookies.items(): jar[k] = v
