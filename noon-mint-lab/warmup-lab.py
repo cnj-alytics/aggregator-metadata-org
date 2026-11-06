@@ -66,6 +66,8 @@ def main():
     WARMUP = spec.get('warmup', 'none')
     PACING = spec.get('pre_mint_pacing', 'fast')
     CHATTER = bool(spec.get('pre_search_chatter'))
+    PROXY = spec.get('proxy')  # e.g. "http://user:pass@host:port" — routes all Noon calls through it
+    if PROXY: say(f"using proxy: {PROXY.split('@')[-1] if '@' in PROXY else PROXY}")
     APPH = bool(spec.get('app_headers', True))
     lat, lng = float(claim['lat']), float(claim['lng'])
     pages = int(claim.get('search_pages') or 10)
@@ -87,7 +89,8 @@ def main():
         if jar: h['Cookie'] = '; '.join(f'{k}={v}' for k, v in jar.items())
         st0 = time.time()
         try:
-            r = s.request(method, url, headers=h, data=body, timeout=20)
+            kw = {'proxies': {'http': PROXY, 'https': PROXY}, 'verify': False} if PROXY else {}
+            r = s.request(method, url, headers=h, data=body, timeout=30, **kw)
             st, txt = r.status_code, r.text
             for k, v in r.cookies.items(): jar[k] = v
         except Exception as e:
