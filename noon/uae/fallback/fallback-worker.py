@@ -82,13 +82,66 @@ ETRACKER_INIT = 'https://etracker.noon.com/init'
 ETRACKER_TRACK = 'https://etracker.noon.com/track/v2/'
 SENTRY_HOST = 'mobile-sentry.noon.team'
 
+VERSION = APP_DEFAULT['version']
+
 def apply_app_identity(app):
-    global BUILD, UA
+    global BUILD, UA, VERSION
     a = app if isinstance(app, dict) else {}
     build = str(a.get('build', '')) if re.fullmatch(r'[0-9]{4,7}', str(a.get('build', ''))) else APP_DEFAULT['build']
+    version = str(a.get('version', '')) if re.fullmatch(r'[0-9]{1,3}(\.[0-9]{1,8}){1,3}', str(a.get('version', ''))) else APP_DEFAULT['version']
     tail = str(a.get('ua_tail', '')) if re.fullmatch(r'[A-Za-z0-9 ./_()-]{1,80}', str(a.get('ua_tail', ''))) else APP_DEFAULT['ua_tail']
-    BUILD, UA = build, f'noon/{build} {tail}'
+    BUILD, VERSION, UA = build, version, f'noon/{build} {tail}'
     return build, UA
+
+# -- etracker telemetry (ported from noon/uae/ranking-scrape.js, iPhone Proxyman schemas) --
+
+def _ms(): return int(time.time() * 1000)
+def noon_app(): return {'mc': 'noon', 'an': 'noon', 'av': VERSION, 'ab': BUILD, 'mpe': 'noon'}
+def food_app(): return {'mc': 'food', 'an': 'noon', 'av': VERSION, 'ab': BUILD, 'mpe': 'food'}
+def device_block(idfv):
+    return {'dm': 'Apple iPhone 17 Pro Max', 'dos': 'ios 27.0.1', 'd': 'Handset', 'sr': '1320x2868', 'vps': '1320x2868', 'scl': 3,
+            'idfa': '00000000-0000-0000-0000-000000000000', 'idfv': idfv}
+def evt(ev, em, vid, idfv):
+    return {'em': em, 'ev': ev, 'ts': _ms(), 'pc': 'noon', 'vid': vid, 'lo': 'en-ae', 'pf': 'ios', 'd': device_block(idfv)}
+def ev_launch(v, i):
+    return evt('launch', {'fsv': '1.00', 'isNA': False, 'nps': 'denied',
+               'perf': {'NTJS': {'d': 700}, 'GWA': {'d': 250}, 'SR': {'d': 280, 'm': {'fsmps': 10}}, 'TJS': {'d': 15500}, 'TAS': {'d': 16200}},
+               **noon_app()}, v, i)
+def ev_launch_info(v, i):
+    now = _ms()
+    return evt('launch_info', {'nsa': now - 10000, 'jsa': now - 9400, 'ds': 0.6, 's': 'app_launch', 'dl': 'en', **noon_app()}, v, i)
+def ev_app_foreground(v, i): return evt('app_foreground', {**food_app()}, v, i)
+def ev_location_fetch(v, i): return evt('location_fetch', {'GPS_allow': True, **noon_app()}, v, i)
+def ev_page_home(v, i): return evt('page_home', {'curl': '/', **noon_app()}, v, i)
+def ev_selected_zone(zh, v, i):
+    g = lambda k, d='': str(zh.get(k) if zh.get(k) is not None else d)
+    return evt('selected_zone', {
+        'szn': g('x-ecom-zonecode', 'AE_DXB-S1'), 'szf': g('x-food-zonecode', 'FOOD-AE-DXB-HUB4-DUBAI_MARINA'),
+        'szi': g('x-nooninstant-zonecode'), 'szr': g('x-rocket-zonecode'), 'sznow': g('x-noonnownow-zonecode'),
+        'szs': g('x-services-zonecode', 'SERVICES-AE-DUBAI'), 'szmpr': g('x-rocket-mp-zonecode'), 'szg': g('x-ecom-zonecode', 'AE_DXB-S1'),
+        'address_codes': [{'mp': m} for m in ('ecom', 'rocket', 'food', 'nooninstant', 'services', 'noonnownow', 'ping', 'out', 'aster', 'money')],
+        **food_app()}, v, i)
+def ev_whoami_ab_config(zh, v, i):
+    raw = zh.get('x-ab-test')
+    ids = []
+    if isinstance(raw, str): ids = [int(x.strip()) for x in raw.split(',') if x.strip().lstrip('-').isdigit()]
+    elif isinstance(raw, list): ids = [x for x in raw if isinstance(x, int) and not isinstance(x, bool)]
+    return evt('whoami_ab_config', {'abIds': ids or [1052, 1471, 1531, 1731, 1750], **noon_app()}, v, i)
+def ev_page_catalog(pn, v, i): return evt('page_catalog', {'hid': str(uuid.uuid4()), 'nbh': 60, 'pn': pn, 'sb': 'browse', **food_app()}, v, i)
+def impression_triplets(outlets, v, i):
+    events = []
+    for idx, o in enumerate(outlets):
+        oc = o.get('outletCode'); df = o.get('distance') or 5.0; sla = o.get('sla') or '30-40'
+        events.append(evt('outlet_impression', {'oc': oc, 'wid': f'search_outlet/{idx}', 'aid': oc, 'ix': f'0/{idx}', 'otg': False,
+                          'df': df, 'fav': False, 'isp': True, 'sla': sla, 'wn': 'search_results', 'wtc': 'search_results_tab',
+                          'curl': '/search?type=outlet', 'src': 'search/results', 'pn': 'Search_Results', **food_app()}, v, i))
+        events.append(evt('outlet_impression_v2', {'pg': 'SR', 'wt': f'SR/search_results/0/search_results_tab/{idx}/ROW/{idx}/ITM/0',
+                          'ul': '/search?type=outlet', 'cf': '{}', 'isp': True, 'oc': oc, 'df': df, 'sla': sla, **food_app()}, v, i))
+        events.append(evt('promotion_impression', {'aid': oc, 'wid': f'search_results/{idx}', 'aidMap': {oc: f'search_results/{idx}'},
+                          'ismMap': {oc: True}, 'curl': '/search?type=outlet', 'toUrl': f'/outlet/{oc}',
+                          'ed': {'eIds': [], 'reqId': str(uuid.uuid4())}, 'cmsEids': {}, 'wp': idx, 'ar': 100,
+                          'adType': 'display', 'isAd': False, **food_app()}, v, i))
+    return events
 
 # -- Supabase (direct, never through the proxy) ---------------------------------
 
@@ -279,6 +332,7 @@ class Customer:
         self.t0 = time.time()
         self.log = []
         self.noon_req = 0
+        self.et_posts = self.et_events = self.et_non2xx = 0
 
     def send(self, step, url, headers, method='GET', body=None):
         jar = self.jar_et if 'etracker' in url else self.jar_noon
@@ -300,6 +354,20 @@ class Customer:
         if st is None: entry['err'] = txt[:120]
         if len(self.log) < 600: self.log.append(entry)
         return st, txt
+
+    def new_identity(self):
+        """A fresh phone session (production's swap: new device id, visitor id and cookies)."""
+        self.dev = str(uuid.uuid4()).upper()
+        self.vis = str(uuid.uuid4()).lower()
+        self.jar_noon, self.jar_et = {}, {}
+
+    def et(self, step, events):
+        """POST events to etracker with the app's full headers (production et())."""
+        st, _ = self.send(step, ETRACKER_TRACK, {**self.base(), 'Content-Type': 'text/plain;charset=UTF-8'},
+                          method='POST', body=json.dumps(events))
+        self.et_posts += 1; self.et_events += len(events)
+        if not (st and 200 <= st < 300): self.et_non2xx += 1
+        return st
 
     def base(self, extra=None):
         extra = dict(extra or {})
@@ -356,10 +424,12 @@ def scrape_area(claim, ctx):
     stop_reason, search_403, search_429, et_posts, et_events, et_non2xx = None, 0, 0, 0, 0, 0
     mint_calls, mint_403 = 0, 0
     resumed_from = 0
-    state = {'minted_at': None, 'refresh_at': 240.0, 'paused': False, 'refreshes': 0}
+    state = {'minted_at': None, 'refresh_at': 280.0, 'paused': False, 'refreshes': 0, 'remints': 0}
+    dev_start = c.dev
+    imp_n = int(ctx.get('impressions_per_page') or 6)
 
-    def new_refresh_at():  # guest token lives 300 s: refresh at a random point in the window (default 200-240 s)
-        lo, hi = float(claim.get('refresh_min_s') or 200), float(claim.get('refresh_max_s') or 240)
+    def new_refresh_at():  # guest token lives 300 s: refresh close to it (Supabase window, default 270-290 s)
+        lo, hi = float(claim.get('refresh_min_s') or 270), float(claim.get('refresh_max_s') or 290)
         return lo + random.random() * max(0.0, hi - lo)
 
     def send429(step, url, headers_fn, method='GET', body=None):
@@ -411,7 +481,7 @@ def scrape_area(claim, ctx):
         audit({
             'area_seq': ctx['area_seq'], 'noon_area_id': area_id, 'area_name': area_name,
             'claimed_at': now_iso(area_start), 'ended_at': now_iso(), 'gap_s': ctx['last_gap_s'],
-            'page_delay_ms': int(ctx['pace'][0] * 1000), 'max_pages': max_pages, 'token_no': 1,
+            'page_delay_ms': int(ctx['pace'][0] * 1000), 'max_pages': max_pages, 'token_no': 1 + state['refreshes'] + state['remints'],
             'token_age_ms': int((time.time() - c.t0) * 1000), 'req_before': 0, 'req_area': c.noon_req,
             'elapsed_ms': int((time.time() - area_start) * 1000), 'outcome': kind, 'pages': pages_done,
             'cards': len(captures) if kind == 'ok' else None, 'rows_parsed': len(rows) if kind == 'ok' else None,
@@ -420,9 +490,10 @@ def scrape_area(claim, ctx):
             'stop_reason': (f"{stop_reason} fleet={FLEET}{':' + PROXY_PORT if PROXY_PORT else ''} persona={ctx['persona']} "
                             f"pace={ctx['pace'][0]}-{ctx['pace'][1]}s resumed_from={resumed_from}") if kind == 'ok' else
                            f"fallback fleet={FLEET}{':' + PROXY_PORT if PROXY_PORT else ''} persona={ctx['persona']}",
-            'rotations': 0, 'recoveries': 1 if state['paused'] else 0, 'recoveries_ok': 0, 'remints': state['refreshes'],
-            'search_403': search_403, 'search_429': search_429, 'et_posts': et_posts, 'et_events': et_events, 'et_non2xx': et_non2xx,
-            'device_id_start': c.dev[:8], 'device_id_end': c.dev[:8], 'req_log': c.log,
+            'rotations': state['remints'], 'recoveries': 1 if state['paused'] else 0, 'recoveries_ok': state.get('remint_ok', 0),
+            'remints': state['refreshes'],
+            'search_403': search_403, 'search_429': search_429, 'et_posts': c.et_posts, 'et_events': c.et_events, 'et_non2xx': c.et_non2xx,
+            'device_id_start': dev_start[:8], 'device_id_end': c.dev[:8], 'req_log': c.log,
             'zone_cached': zone_cached, 'mint_calls': mint_calls, 'mint_403': mint_403, 'mint_swaps': 0,
         })
         say(f"area {area_name}: {kind}{f' ({status} @ {step})' if kind != 'ok' else ''} pages={pages_done} cards={len(captures)} "
@@ -431,64 +502,93 @@ def scrape_area(claim, ctx):
 
     def kind_of(st): return 'rate_limited' if st == 429 else 'blocked' if st == 403 else 'error'
 
-    try:
-        # --- warm-up (lab U5: sentry_etracker + natural pacing) ---
-        sentry = sentry_preflight()
-        st, _ = c.send('etracker_init', ETRACKER_INIT, {'User-Agent': UA, 'Accept': '*/*', 'Connection': 'keep-alive'})
-        time.sleep(1.8 + random.random() * 0.6)
+    loc_h = {'x-experience': 'ecom', 'x-locale': 'en-ae', 'x-device-lat': str(lat), 'x-device-lng': str(lng), 'Content-Type': 'application/json'}
 
-        # --- mint: whoami ---
+    def mint(tag):
+        """Full app mint with production telemetry: whoami -> launch events -> set-location -> location events
+        -> (fd whoami if the zone is not cached) -> zone events. Returns (status, failing_step)."""
+        nonlocal zone, mint_calls, mint_403
         time.sleep(permit())
-        st, _ = send429('mint_whoami', WHOAMI_URL, lambda: c.base({'x-whoami-request-id': str(uuid.uuid4())}))
+        st, _ = send429(f'{tag}whoami', WHOAMI_URL, lambda: c.base({'x-whoami-request-id': str(uuid.uuid4())}))
         mint_calls += 1
         if st != 200:
             mint_403 += 1 if st in (403, 429) else 0
-            return finish(kind_of(st), st, 'mint_whoami', f'mint_whoami {st} (sentry={sentry})')
+            return st, f'{tag}whoami'
         state['minted_at'] = time.time(); state['refresh_at'] = new_refresh_at()
-        time.sleep(1.8 + random.random() * 0.6)
-        st, _ = c.send('etracker_track', ETRACKER_TRACK, {'User-Agent': UA, 'Content-Type': 'application/json', 'Accept': '*/*'},
-                       method='POST', body=json.dumps([{'em': {'app': 'noon', 'v': 1}, 'ev': 'launch',
-                                                         'ts': int(time.time() * 1000), 'pc': 'noon', 'vid': c.vis}]))
-        et_posts += 1; et_events += 1; et_non2xx += 0 if st and 200 <= st < 300 else 1
-        time.sleep(4.0 + random.random() * 1.2)
-
-        # --- set-location ---
-        loc_h = {'x-experience': 'ecom', 'x-locale': 'en-ae', 'x-device-lat': str(lat), 'x-device-lng': str(lng), 'Content-Type': 'application/json'}
-        st, _ = send429('mint_set_location', SET_LOC_URL, lambda: c.base(loc_h), method='POST',
+        time.sleep(0.3 + random.random() * 0.3)
+        c.et(f'et_{tag}launch', [ev_launch(c.vis, c.dev), ev_launch_info(c.vis, c.dev), ev_app_foreground(c.vis, c.dev)])
+        time.sleep(1.2 + random.random() * 0.8)
+        st, _ = send429(f'{tag}set_location', SET_LOC_URL, lambda: c.base(loc_h), method='POST',
                         body=json.dumps({'location': {'lat': lat, 'lng': lng}, 'lang': 'en'}))
         mint_calls += 1
         if st != 200:
             mint_403 += 1 if st in (403, 429) else 0
-            return finish(kind_of(st), st, 'mint_set_location', f'set_location {st}')
-
-        # --- zone headers: cached (lab) or fetched once via fd whoami ---
-        if not zone:
+            return st, f'{tag}set_location'
+        time.sleep(0.2 + random.random() * 0.3)
+        c.et(f'et_{tag}location', [ev_location_fetch(c.vis, c.dev), ev_page_home(c.vis, c.dev)])
+        if not zone:  # zone headers not cached for this area: fetch once via fd whoami, like the app
             time.sleep(0.8 + random.random() * 0.6)
             fd_h = {'x-experience': 'food', 'x-locale': 'en-ae', 'x-device-lat': str(lat), 'x-device-lng': str(lng),
                     'x-mp-country': 'ae', 'x-lat': str(round(lat * 1e7)), 'x-lng': str(round(lng * 1e7))}
-            st, txt = send429('mint_fd_whoami', FD_WHOAMI_URL, lambda: c.base(fd_h))
+            st, txt = send429(f'{tag}fd_whoami', FD_WHOAMI_URL, lambda: c.base(fd_h))
             mint_calls += 1
             if st != 200:
                 mint_403 += 1 if st in (403, 429) else 0
-                return finish(kind_of(st), st, 'mint_fd_whoami', f'fd_whoami {st}')
+                return st, f'{tag}fd_whoami'
             try:
                 j = json.loads(txt)
                 zone = {k: v for k, v in (j.get('headers') or {}).items() if v is not None and not isinstance(v, (dict, list))}
             except Exception:
                 zone = {}
+        time.sleep(0.15 + random.random() * 0.25)
+        c.et(f'et_{tag}zone', [ev_whoami_ab_config(zone, c.vis, c.dev), ev_selected_zone(zone, c.vis, c.dev)])
+        return 200, None
+
+    def remint_after_403(where):
+        """403: a new phone session (fresh device, visitor, cookies) mints a new token; up to remints_403 per area.
+        Returns the final mint status (200 = new token ready) and the step that failed."""
+        limit = int(claim.get('remints_403') if claim.get('remints_403') is not None else 2)
+        st, fstep = 403, where
+        while st == 403 and state['remints'] < limit:
+            state['remints'] += 1
+            old = c.dev[:8]
+            c.new_identity()
+            say(f'403 at {fstep}: new token #{state["remints"]} (device {old} -> {c.dev[:8]})')
+            time.sleep(3 + random.random() * 3)
+            st, fstep = mint(f'remint{state["remints"]}_')
+            if st == 200:
+                state['remint_ok'] = state.get('remint_ok', 0) + 1
+                return 200, None
+        return st, fstep
+
+    try:
+        # --- warm-up (lab U5: sentry + etracker init) ---
+        sentry = sentry_preflight()
+        c.send('etracker_init', ETRACKER_INIT, {'User-Agent': UA, 'Accept': '*/*', 'Connection': 'keep-alive'})
+        time.sleep(1.8 + random.random() * 0.6)
+
+        # --- mint (retry with a new token on 403) ---
+        st, fstep = mint('mint_')
+        if st == 403:
+            st, fstep = remint_after_403(fstep)
+        if st != 200:
+            return finish(kind_of(st), st, fstep, f'{fstep} {st} (sentry={sentry})')
         time.sleep(1.0 + random.random() * 1.0)
 
-        # --- pagination (persona pace; production stop rules) ---
+        # --- pagination (persona pace; production stop rules + production telemetry) ---
         first_page = True
         while pages_done < max_pages:
             gap = 0.0 if first_page else ctx['pace'][0] + random.random() * max(0.0, ctx['pace'][1] - ctx['pace'][0])
             first_page = False
             time.sleep(max(gap, permit()))  # persona pace, but never faster than this IP's page budget
-            if time.time() - state['minted_at'] >= state['refresh_at']:  # refresh before the 300 s token expiry
+            if time.time() - state['minted_at'] >= state['refresh_at']:  # refresh close to the 300 s token expiry
                 st, _ = send429('token_refresh', WHOAMI_URL, lambda: c.base({'x-whoami-request-id': str(uuid.uuid4())}))
+                if st == 403:
+                    st, _ = remint_after_403('token_refresh')
+                elif st == 200:
+                    state['minted_at'] = time.time(); state['refresh_at'] = new_refresh_at(); state['refreshes'] += 1
                 if st != 200:
                     return finish(kind_of(st), st, 'token_refresh', f'token refresh {st} at page {pages_done + 1}', pages_done + 1)
-                state['minted_at'] = time.time(); state['refresh_at'] = new_refresh_at(); state['refreshes'] += 1
                 time.sleep(0.6 + random.random() * 1.2)
                 time.sleep(permit())
             body = {'queryEntity': None, 'q': None, 'f': {}, 'contexts': [], 'withContent': True, 'excludeOutletCodes': [],
@@ -512,6 +612,11 @@ def scrape_area(claim, ctx):
                 st, txt = c.send('search_retry1', SEARCH_URL, c.base(sh), method='POST', body=json.dumps(body))
             if st == 403: search_403 += 1
             if st == 429: search_429 += 1
+            if st == 403:  # new token (fresh phone session), then retry this same page from the saved search token
+                rst, _ = remint_after_403(f'search p{pages_done + 1}')
+                if rst == 200:
+                    first_page = True
+                    continue
             if st == 404: stop_reason = f'404@{pages_done + 1}'; break
             if st != 200:
                 return finish(kind_of(st), st, 'search', f'search {st} at page {pages_done + 1}', pages_done + 1)
@@ -526,6 +631,13 @@ def scrape_area(claim, ctx):
             if fresh == 0: stop_reason = f'no-new@{pages_done}'; break
             if not j.get('searchToken'): stop_reason = f'no-token@{pages_done}'; break
             token = j['searchToken']
+            # Telemetry after each page, like the app (production): page_catalog + impressions of visible outlets
+            time.sleep(0.15 + random.random() * 0.2)
+            c.et('et_page_catalog', [ev_page_catalog(pages_done, c.vis, c.dev)])
+            visible = outlets[:imp_n]
+            if visible:
+                time.sleep(0.5 + random.random() * 0.9)
+                c.et('et_impressions', impression_triplets(visible, c.vis, c.dev))
             if pages_done % 10 == 0: say(f'p{pages_done}: {len(seen)} cards so far')
         if not stop_reason: stop_reason = f'max-pages({max_pages})'
         return finish('ok')
@@ -566,6 +678,9 @@ def main():
 
         ctx = {'non_food': non_food, 'dry_run': bool(start.get('dry_run')), 'scrape_date': start.get('scrape_date'),
                'scrape_hour': start.get('scrape_hour'), 'area_seq': 0, 'last_gap_s': 0, 'persona': None, 'pace': (6.0, 15.0)}
+        tel = (spec.get('telemetry') if isinstance(spec, dict) else None) or {}
+        lo, hi = int(tel.get('impressions_per_page_min') or 4), int(tel.get('impressions_per_page_max') or 10)
+        ctx['impressions_per_page'] = random.randint(min(lo, hi), max(lo, hi))  # per session, like production
         consecutive_blocks = 0
         while True:
             if time.time() - START > WALL_LIMIT_S: exit_reason = 'wall_limit'; break
