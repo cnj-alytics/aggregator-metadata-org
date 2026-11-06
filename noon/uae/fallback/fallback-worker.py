@@ -432,6 +432,15 @@ def scrape_area(claim, ctx):
         lo, hi = float(claim.get('refresh_min_s') or 270), float(claim.get('refresh_max_s') or 290)
         return lo + random.random() * max(0.0, hi - lo)
 
+    def refresh_token():
+        """whoami with the current session before the 300 s expiry; a 403 mints a new token. Returns status."""
+        st, _ = send429('token_refresh', WHOAMI_URL, lambda: c.base({'x-whoami-request-id': str(uuid.uuid4())}))
+        if st == 403:
+            st, _ = remint_after_403('token_refresh')
+        elif st == 200:
+            state['minted_at'] = time.time(); state['refresh_at'] = new_refresh_at(); state['refreshes'] += 1
+        return st
+
     def send429(step, url, headers_fn, method='GET', body=None):
         """One 30 s pause per area on a 429 (the whole IP backs off via Supabase), then one retry."""
         st, txt = c.send(step, url, headers_fn(), method=method, body=body)
@@ -439,7 +448,17 @@ def scrape_area(claim, ctx):
             state['paused'] = True
             w = permit(int(claim.get('pause_429_s') or 30))
             say(f'429 at {step}: pausing {w:.0f}s (whole IP) then one retry')
-            time.sleep(w + random.random() * 3)
+            w = w + random.random() * 3
+            # keep the token valid across the pause: refresh at its due time inside the pause (search only)
+            due = (state['minted_at'] + state['refresh_at'] - time.time()) if (step == 'search' and state['minted_at']) else None
+            if due is not None and due < w:
+                time.sleep(max(0.0, due))
+                t_ref = time.time()
+                rst = refresh_token()
+                if rst != 200:
+                    return rst, ''
+                w = max(0.0, w - max(0.0, due) - (time.time() - t_ref)) + 0.6 + random.random() * 1.0
+            time.sleep(w)
             st, txt = c.send(f'{step}_after429', url, headers_fn(), method=method, body=body)
             say(f'  after pause: {step} -> {st}')
         return st, txt
@@ -580,17 +599,17 @@ def scrape_area(claim, ctx):
         while pages_done < max_pages:
             gap = 0.0 if first_page else ctx['pace'][0] + random.random() * max(0.0, ctx['pace'][1] - ctx['pace'][0])
             first_page = False
-            time.sleep(max(gap, permit()))  # persona pace, but never faster than this IP's page budget
-            if time.time() - state['minted_at'] >= state['refresh_at']:  # refresh close to the 300 s token expiry
-                st, _ = send429('token_refresh', WHOAMI_URL, lambda: c.base({'x-whoami-request-id': str(uuid.uuid4())}))
-                if st == 403:
-                    st, _ = remint_after_403('token_refresh')
-                elif st == 200:
-                    state['minted_at'] = time.time(); state['refresh_at'] = new_refresh_at(); state['refreshes'] += 1
+            wait = max(gap, permit())  # persona pace, but never faster than this IP's page budget
+            # The token is refreshed on time (270-290 s) even when that point falls inside this wait
+            due = state['minted_at'] + state['refresh_at'] - time.time()
+            if due < wait:
+                time.sleep(max(0.0, due))
+                t_ref = time.time()
+                st = refresh_token()
                 if st != 200:
                     return finish(kind_of(st), st, 'token_refresh', f'token refresh {st} at page {pages_done + 1}', pages_done + 1)
-                time.sleep(0.6 + random.random() * 1.2)
-                time.sleep(permit())
+                wait = max(0.0, wait - max(0.0, due) - (time.time() - t_ref)) + 0.6 + random.random() * 1.2
+            time.sleep(max(0.0, wait))
             body = {'queryEntity': None, 'q': None, 'f': {}, 'contexts': [], 'withContent': True, 'excludeOutletCodes': [],
                     'limit': 60, 'scopes': None, 'page': 1, 'dishTags': [], 'ratingMin': None,
                     'sort': {'by': 'popularity', 'dir': 'desc', 'slab': None}, 'widgets': None, 'content': None,
