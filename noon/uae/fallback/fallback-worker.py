@@ -51,6 +51,7 @@ START_JSON = os.environ.get('FB_START_JSON') or ''
 # DC: each worker has its own IP, so page pacing is local to the worker (the Supabase bucket key
 # for 'dc' is fleet-wide and would squeeze every DC IP into one IP's budget).
 IP_PAGES_PER_MIN = float(os.environ.get('FB_IP_PAGES_PER_MIN') or 12)
+DEADLINE_MARGIN_S = 20  # stop paging this long before the run deadline so the partial save lands by :55
 START = time.time()
 
 P = f'[fb m{MACHINE} {FLEET}{":" + PROXY_PORT if PROXY_PORT else ""}]'
@@ -175,10 +176,22 @@ def rest_patch(table, query, body):
     except Exception as e:
         say(f'heartbeat failed: {str(e)[:120]}')
 
+STOP = threading.Event()  # set when Supabase has closed this machine (fallback over, deadline, run closed)
+
 def heartbeat_loop():
     while True:
         time.sleep(30)
-        rest_patch('noon_ranking_run_machine', f'run_id=eq.{RUN_ID}&machine_no=eq.{MACHINE}', {'last_seen_at': now_iso()})
+        try:
+            r = cr.patch(f'{SUPABASE_URL}/rest/v1/noon_ranking_run_machine?run_id=eq.{RUN_ID}&machine_no=eq.{MACHINE}&select=status',
+                         json={'last_seen_at': now_iso()}, timeout=5,
+                         headers={'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}',
+                                  'Content-Type': 'application/json', 'Prefer': 'return=representation'})
+            rows = r.json() if r.status_code < 300 else None
+            if isinstance(rows, list) and rows and rows[0].get('status') not in ('working', 'dispatched'):
+                if not STOP.is_set(): say(f"machine closed by Supabase (status={rows[0].get('status')}) - stopping")
+                STOP.set()
+        except Exception as e:
+            say(f'heartbeat failed: {str(e)[:120]}')
 
 def permit(penalty_s=0):
     """Per-IP page budget (Supabase noon_ranking_fb_page_permit): seconds to wait before the next Noon page.
@@ -448,6 +461,10 @@ def scrape_area(claim, ctx):
     on_429 = str(claim.get('on_429') or 'pause')  # Supabase: 'remint' = new device + new token on a search 429
     dev_start = c.dev
     imp_n = int(ctx.get('impressions_per_page') or 6)
+    # Hard stop at the run deadline (:55): stop paging DEADLINE_MARGIN_S early and save what is scraped.
+    try: stop_at = datetime.fromisoformat(str(claim.get('deadline_at')).replace('Z', '+00:00')).timestamp() - DEADLINE_MARGIN_S
+    except Exception: stop_at = None
+    def past_deadline(): return stop_at is not None and time.time() >= stop_at
 
     # Token refresh REMOVED: Proxyman confirmed the real Noon app never refreshes
     # the guest token mid-session. Refreshing was triggering 429s.
@@ -479,6 +496,16 @@ def scrape_area(claim, ctx):
     def finish(kind, status=None, step=None, err=None, fail_page=None):
         rows, dropped = ([], 0)
         saved = pending = 0
+        if kind == 'stopped':  # Supabase closed this machine: the area is no longer ours - no save, no report
+            say(f'area {area_name}: stopped by Supabase at page {pages_done}, nothing saved')
+            return kind, None
+        if kind == 'ok' and pages_done == 0 and str(stop_reason or '').startswith('deadline'):
+            kind = 'deadline'
+        if kind == 'deadline':  # deadline before the first page: nothing to save
+            rep = rpc('noon_ranking_report', {'p_run_id': RUN_ID, 'p_machine_no': MACHINE, 'p_area_id': area_id,
+                                              'p_result': {'status': 'deadline'}})
+            say(f'area {area_name}: deadline before the first page | report={json.dumps(rep)[:100]}')
+            return kind, None
         if kind == 'ok':
             rows, dropped = parse_cards(captures, ctx['non_food'])
             if not ctx['dry_run'] and rows:
@@ -489,7 +516,7 @@ def scrape_area(claim, ctx):
             rep = rpc('noon_ranking_report', {'p_run_id': RUN_ID, 'p_machine_no': MACHINE, 'p_area_id': area_id, 'p_result': {
                 'status': 'ok', 'pages_scraped': pages_done, 'cards': len(captures), 'ranking_rows': saved,
                 'pending_rows': pending, 'dropped': dropped, 'bytes': 0, 'fetch_ms': int((time.time() - area_start) * 1000),
-                'rotations': 0, 'recoveries': 0}})
+                'rotations': 0, 'recoveries': 0, 'stop_reason': stop_reason}})
         else:
             if token and pages_done > 0:
                 try:
@@ -592,6 +619,8 @@ def scrape_area(claim, ctx):
         c.send('etracker_init', ETRACKER_INIT, {'User-Agent': UA, 'Accept': '*/*', 'Connection': 'keep-alive'})
         time.sleep(1.8 + random.random() * 0.6)
 
+        if STOP.is_set(): return finish('stopped')
+        if past_deadline(): stop_reason = 'deadline@0'; return finish('deadline')
         # --- mint (retry with a new token on 403) ---
         st, fstep = mint('mint_')
         if st == 403:
@@ -606,8 +635,11 @@ def scrape_area(claim, ctx):
             gap = 0.0 if first_page else ctx['pace'][0] + random.random() * max(0.0, ctx['pace'][1] - ctx['pace'][0])
             first_page = False
             wait = max(gap, permit())  # persona pace, but never faster than this IP's page budget
+            if stop_at is not None: wait = min(wait, max(0.0, stop_at - time.time()))
             # Token refresh REMOVED: real app never refreshes mid-session (Proxyman confirmed)
             time.sleep(max(0.0, wait))
+            if STOP.is_set(): return finish('stopped')
+            if past_deadline(): stop_reason = f'deadline@{pages_done}'; break
             body = {'queryEntity': None, 'q': None, 'f': {}, 'contexts': [], 'withContent': True, 'excludeOutletCodes': [],
                     'limit': 60, 'scopes': None, 'page': 1, 'dishTags': [], 'ratingMin': None,
                     'sort': {'by': 'popularity', 'dir': 'desc', 'slab': None}, 'widgets': None, 'content': None,
@@ -738,6 +770,8 @@ def main():
                 say(f"persona {ctx['persona']} (page gap {lo}-{hi}s)")
             ctx['area_seq'] += 1
             kind, st = scrape_area(claim, ctx)
+            if kind in ('stopped', 'deadline'):
+                exit_reason = kind; break
             if kind in ('blocked', 'rate_limited'):
                 consecutive_blocks += 1
                 if consecutive_blocks >= int(claim.get('max_consecutive_blocks') or 2):
@@ -748,7 +782,8 @@ def main():
             gap = gmin + random.random() * max(0.0, gmax - gmin)
             if kind != 'ok': gap *= 2  # back off longer after a block, like a user giving up for a bit
             ctx['last_gap_s'] = round(gap, 1)
-            time.sleep(gap)
+            STOP.wait(gap)
+            if STOP.is_set(): exit_reason = 'stopped'; break
     finally:
         if SHARED:
             say(f'=== worker done: {exit_reason} ===')
