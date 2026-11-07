@@ -369,16 +369,26 @@ let MAX_AREAS = 2;
 // other Supabase contact). Without it the tick's silent-timeout watchdog
 // marks healthy machines 'lost' and re-queues their areas. Fire-and-forget.
 let lastBeat = Date.now();
+// STOPPED (2026-11-08): Supabase closed this machine (fallback took over, deadline, run closed). The area is no
+// longer ours, so the machine stops without saving or reporting it.
+let STOPPED = false;
 function heartbeat(force = false) {
   if (!force && Date.now() - lastBeat < 60000) return;
   lastBeat = Date.now();
-  fetch(`${SUPABASE_URL}/rest/v1/noon_ranking_run_machine?run_id=eq.${RUN_ID}&machine_no=eq.${MACHINE}`, {
+  fetch(`${SUPABASE_URL}/rest/v1/noon_ranking_run_machine?run_id=eq.${RUN_ID}&machine_no=eq.${MACHINE}&select=status`, {
     method: 'PATCH',
-    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=representation' },
     body: JSON.stringify({ last_seen_at: new Date().toISOString() }),
     signal: AbortSignal.timeout(5000),
-  }).then((r) => { if (!r.ok) say(`heartbeat HTTP ${r.status}`); }).catch((e) => say(`heartbeat failed: ${e.message}`));
+  }).then(async (r) => {
+    if (!r.ok) { say(`heartbeat HTTP ${r.status}`); return; }
+    const rows = await r.json().catch(() => null);
+    const st = Array.isArray(rows) && rows[0] ? rows[0].status : null;
+    if (st && st !== 'working' && st !== 'dispatched' && !STOPPED) { STOPPED = true; say(`machine closed by Supabase (status=${st}) — stopping`); }
+  }).catch((e) => say(`heartbeat failed: ${e.message}`));
 }
+// Hard stop at the run deadline (:55): stop paging this long before it so the partial save lands in time.
+const DEADLINE_MARGIN_MS = 20000;
 
 async function audit(row) {
   try {
@@ -646,7 +656,15 @@ function parseCards(outlets, nonFoodSet) {
     const areaName = claim.area_name || String(areaId);
     const lat = Number(claim.lat), lng = Number(claim.lng);
     const maxPages = Number(claim.max_pages) || 120;
+    const stopAtMs = claim.deadline_at ? Date.parse(claim.deadline_at) - DEADLINE_MARGIN_MS : null;
+    const pastDeadline = () => stopAtMs != null && Date.now() >= stopAtMs;
     if (claim.gap_seconds > 0) await sleep(claim.gap_seconds * 1000);
+    if (STOPPED) { exitReason = 'stopped'; break; }
+    if (pastDeadline()) {
+      const rep = await rpc('noon_ranking_report', { p_run_id: RUN_ID, p_machine_no: MACHINE, p_area_id: claim.noon_area_id, p_result: { status: 'deadline' } });
+      say(`deadline before area ${claim.area_name || claim.noon_area_id} started — reported: ${JSON.stringify(rep)}`);
+      exitReason = 'deadline'; break;
+    }
     say(`=== AREA ${areaIdx + 1}/${MAX_AREAS}: ${areaName} id=${areaId} (${lat},${lng}) ===`);
 
     const areaStart = Date.now();
@@ -855,6 +873,8 @@ function parseCards(outlets, nonFoodSet) {
       // --- Pagination (v3 verbatim, page cap from Supabase claim) ---
       while (pagesDone < maxPages) {
         heartbeat();
+        if (STOPPED) break;
+        if (pastDeadline()) { stopReason = `deadline@${pagesDone}`; break; }
         if (SPEC.periodic_identity_rotation.enabled && pagesDone > 0) {
           const every = SPEC.periodic_identity_rotation.every_pages;
           const atList = SPEC.periodic_identity_rotation.at_pages || [];
@@ -984,6 +1004,13 @@ function parseCards(outlets, nonFoodSet) {
       break;
     }
 
+    if (STOPPED) { say(`stopped by Supabase at page ${pagesDone} — area not saved`); exitReason = 'stopped'; break; }
+    if (String(stopReason || '').startsWith('deadline') && captures.length === 0) {
+      const rep = await rpc('noon_ranking_report', { p_run_id: RUN_ID, p_machine_no: MACHINE, p_area_id: areaId, p_result: { status: 'deadline' } });
+      say(`deadline before the first page of ${areaName} — reported: ${JSON.stringify(rep)}`);
+      exitReason = 'deadline'; break;
+    }
+
     // --- Success: build rows, save, report (previous production contract) ---
     const parsed = parseCards(captures, nonFoodSet);
     let savedAnalysis = 0, savedPending = 0;
@@ -1000,6 +1027,7 @@ function parseCards(outlets, nonFoodSet) {
         ranking_rows: savedAnalysis, pending_rows: savedPending, dropped: parsed.dropped,
         bytes: 0, fetch_ms: elapsed,
         rotations: identityRotations - rotBefore, recoveries: recoveryAttempts - recBefore,
+        stop_reason: stopReason,
       },
     });
     await audit({
@@ -1016,6 +1044,7 @@ function parseCards(outlets, nonFoodSet) {
     totalAreas++; totalRows += parsed.rows.length; totalDropped += parsed.dropped;
     say(`${areaName} ok: ${captures.length} cards, ${parsed.rows.length} rows (${parsed.dropped} non-food dropped), ${pagesDone}p, ${Math.round(elapsed / 1000)}s, recoveries=${recoveryAttempts - recBefore} | ${stopReason}${resumedFrom ? ` (resumed from page ${resumedFrom + 1})` : ''} | saved=${savedAnalysis} pending=${savedPending} -> ${rep && rep.action}`);
 
+    if (String(stopReason || '').startsWith('deadline')) { exitReason = 'deadline'; break; }
     if (rep && rep.action === 'stop_job') { exitReason = 'stop_job'; break; }
     if (areaIdx === 0 && pagesDone >= EARLY_EXIT_PAGES) { say(`area 1 was ${pagesDone}p (>= ${EARLY_EXIT_PAGES}) — not claiming area 2`); exitReason = 'first_area_long'; break; }
     if (rep && rep.gap_seconds > 0) await sleep(rep.gap_seconds * 1000);
