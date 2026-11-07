@@ -1,0 +1,61 @@
+name: Noon UAE – Ranking fallback multi-worker (6 IPs per machine)
+
+# PRODUCTION fallback fleet using Decodo datacenter IPs.
+# One GitHub machine runs 6 parallel fallback-worker.py instances,
+# each with its own proxy IP via Decodo port routing.
+# Dispatched by Supabase: noon_ranking_fb_dispatch_multi()
+#
+# Machine 1 → ports 10001-10006, Machine 2 → ports 10007-10012, etc.
+# 42 machines × 6 workers = 252 IPs covering 504 areas in ~20 min.
+
+run-name: fb-multi run ${{ inputs.run_id }} m${{ inputs.machine_no }} (6 workers)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'noon_ranking_run.run_id'
+        required: true
+        type: string
+      machine_no:
+        description: 'machine_no (1-based, determines port range)'
+        required: true
+        type: string
+      worker_count:
+        description: 'workers per machine (default 6)'
+        required: false
+        type: string
+        default: '6'
+
+concurrency:
+  group: noon-uae-fallback-multi-${{ inputs.run_id }}-m${{ inputs.machine_no }}
+  cancel-in-progress: false
+
+jobs:
+  multi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    name: fb-multi run ${{ inputs.run_id }} m${{ inputs.machine_no }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: noon/uae/fallback
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install -q curl_cffi==0.17.0
+
+      - name: Run multi-worker fallback
+        working-directory: noon/uae/fallback
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RUN_ID: ${{ inputs.run_id }}
+          MACHINE_NO: ${{ inputs.machine_no }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          NOON_PROXY_URL_DC: ${{ secrets.NOON_PROXY_URL_DC }}
+          WORKER_COUNT: ${{ inputs.worker_count || '6' }}
+          WALL_LIMIT_SEC: '3600'
+        run: python -u multi-worker.py
