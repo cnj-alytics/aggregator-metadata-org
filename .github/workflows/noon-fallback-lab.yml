@@ -16,7 +16,7 @@ on:
         required: true
         type: string
       fleet:
-        description: 'uae | decodo'
+        description: 'uae | decodo | dc_free'
         required: true
         type: string
       proxy_port:
@@ -58,7 +58,7 @@ jobs:
           MACHINE_NO: ${{ inputs.machine_no }}
           FLEET: ${{ inputs.fleet }}
           PROXY_PORT: ${{ inputs.proxy_port }}
-          NOON_PROXY_URL: ${{ inputs.fleet == 'decodo' && secrets.NOON_PROXY_URL_DECODO || secrets.NOON_PROXY_URL }}
+          NOON_PROXY_URL: ${{ inputs.fleet == 'dc_free' && secrets.NOON_PROXY_URL_DC_FREE || (inputs.fleet == 'decodo' && secrets.NOON_PROXY_URL_DECODO || secrets.NOON_PROXY_URL) }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           WALL_LIMIT_SEC: '3600'
           MAX_AREAS: ${{ inputs.max_areas || '5' }}
