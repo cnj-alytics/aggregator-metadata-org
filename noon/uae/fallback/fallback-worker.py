@@ -44,6 +44,13 @@ GH_RUN_ID = os.environ.get('GITHUB_RUN_ID', '')
 FLEET = (os.environ.get('FLEET') or '').strip().lower()
 PROXY_PORT = (os.environ.get('PROXY_PORT') or '').strip()
 WALL_LIMIT_S = int(os.environ.get('WALL_LIMIT_SEC') or 4000)
+# Set by multi-worker.py (DC fleet): several workers share ONE run_machine row. The coordinator does
+# machine_start / machine_end once; workers skip both and get the start payload via FB_START_JSON.
+SHARED = os.environ.get('FB_SHARED_MACHINE') == '1'
+START_JSON = os.environ.get('FB_START_JSON') or ''
+# DC: each worker has its own IP, so page pacing is local to the worker (the Supabase bucket key
+# for 'dc' is fleet-wide and would squeeze every DC IP into one IP's budget).
+IP_PAGES_PER_MIN = float(os.environ.get('FB_IP_PAGES_PER_MIN') or 12)
 START = time.time()
 
 P = f'[fb m{MACHINE} {FLEET}{":" + PROXY_PORT if PROXY_PORT else ""}]'
@@ -176,6 +183,8 @@ def heartbeat_loop():
 def permit(penalty_s=0):
     """Per-IP page budget (Supabase noon_ranking_fb_page_permit): seconds to wait before the next Noon page.
     penalty_s > 0 after a 429: every machine on this IP backs off that long. Never blocks scraping on a DB hiccup."""
+    if FLEET == 'dc':
+        return local_permit(penalty_s)
     try:
         r = cr.post(f'{SUPABASE_URL}/rest/v1/rpc/noon_ranking_fb_page_permit', timeout=8,
                     json={'p_run_id': RUN_ID, 'p_machine_no': MACHINE, 'p_penalty_s': int(penalty_s)},
@@ -186,6 +195,18 @@ def permit(penalty_s=0):
     except Exception as e:
         say(f'permit failed: {str(e)[:100]}')
     return float(penalty_s)
+
+_local_next_at = 0.0
+def local_permit(penalty_s=0):
+    """Same token-bucket maths as noon_ranking_fb_page_permit, kept in-process (one worker = one IP)."""
+    global _local_next_at
+    now = time.time()
+    if penalty_s and penalty_s > 0:
+        _local_next_at = max(_local_next_at, now + penalty_s)
+        return float(penalty_s)
+    slot = max(_local_next_at, now)
+    _local_next_at = slot + (60.0 / max(IP_PAGES_PER_MIN, 0.5)) * (0.7 + random.random() * 0.6)
+    return max(0.0, slot - now)
 
 RUNNER_IP = None
 def audit(row):
@@ -669,11 +690,16 @@ def main():
     PROXY = pick_proxy()
     if not PROXY:
         say('no proxy configured for this fleet - refusing to run (fallback never goes direct)')
+        if SHARED: sys.exit(1)  # coordinator owns machine_end
         try: rpc('noon_ranking_machine_end', {'p_run_id': RUN_ID, 'p_machine_no': MACHINE, 'p_reason': 'no_proxy_configured'})
         except Exception: pass
         sys.exit(1)
 
-    start = rpc('noon_ranking_machine_start', {'p_run_id': RUN_ID, 'p_machine_no': MACHINE, 'p_github_run_id': GH_RUN_ID})
+    if SHARED:
+        try: start = json.loads(START_JSON)
+        except Exception: start = None
+    else:
+        start = rpc('noon_ranking_machine_start', {'p_run_id': RUN_ID, 'p_machine_no': MACHINE, 'p_github_run_id': GH_RUN_ID})
     if not start or start.get('stop') or start.get('error'):
         say(f'told to stop at check-in: {json.dumps(start)[:200]}'); return
     threading.Thread(target=heartbeat_loop, daemon=True).start()
@@ -724,6 +750,10 @@ def main():
             ctx['last_gap_s'] = round(gap, 1)
             time.sleep(gap)
     finally:
+        if SHARED:
+            say(f'=== worker done: {exit_reason} ===')
+            print(f'FB_EXIT_REASON={exit_reason}', flush=True)
+            return
         try:
             rpc('noon_ranking_machine_end', {'p_run_id': RUN_ID, 'p_machine_no': MACHINE, 'p_reason': f'fallback: {exit_reason}'})
         except Exception as e:
