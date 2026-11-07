@@ -305,27 +305,30 @@ function evPageCatalog(pageNum, v, i) {
   return evt('page_catalog', { hid: crypto.randomUUID(), nbh: 60, pn: pageNum, sb: 'browse', ...FOOD_APP }, v, i);
 }
 function evOutletImpression(o, idx, v, i) {
-  return evt('outlet_impression', { oc: o.outletCode, wid: `search_outlet/${idx}`, aid: o.outletCode, ix: `0/${idx}`, otg: false,
-    df: o.distance || 5.0, fav: false, isp: true, sla: o.sla || '30-40', wn: 'search_results', wtc: 'search_results_tab',
-    curl: '/search?type=outlet', src: 'search/results', pn: 'Search_Results', ...FOOD_APP }, v, i);
+  // Matched to real app Proxyman trace: pn=Home_page, isp=false, no src/wn/wtc/otg
+  return evt('outlet_impression', { aid: o.outletCode, wid: `search_outlet/${idx}`, oc: o.outletCode, ix: `0/${idx}`,
+    df: o.distance || 5.0, fav: false, isp: false, sla: o.sla || '30-40',
+    curl: '/search?type=outlet', pn: 'Home_page', ...FOOD_APP }, v, i);
 }
 function evOutletImpressionV2(o, idx, v, i) {
+  // Matched to real app Proxyman trace: no isp field
   return evt('outlet_impression_v2', { pg: 'SR', wt: `SR/search_results/0/search_results_tab/${idx}/ROW/${idx}/ITM/0`,
-    ul: '/search?type=outlet', cf: '{}', isp: true, oc: o.outletCode, df: o.distance || 5.0, sla: o.sla || '30-40', ...FOOD_APP }, v, i);
+    ul: '/search?type=outlet', cf: '{}', oc: o.outletCode, df: o.distance || 5.0, sla: o.sla || '30-40', ...FOOD_APP }, v, i);
 }
-function evPromotionImpression(o, idx, v, i) {
-  return evt('promotion_impression', { aid: o.outletCode, wid: `search_results/${idx}`,
-    aidMap: { [o.outletCode]: `search_results/${idx}` }, ismMap: { [o.outletCode]: true },
-    curl: '/search?type=outlet', toUrl: `/outlet/${o.outletCode}`, ed: { eIds: [], reqId: crypto.randomUUID() },
-    cmsEids: {}, wp: idx, ar: 100, adType: 'display', isAd: false, ...FOOD_APP }, v, i);
-}
-function impressionTripletsBatch(outlets, startIdx, v, i) {
-  const events = [];
+// promotion_impression removed — real app does not send it during scroll pagination
+function impressionPairBatches(outlets, startIdx, v, i) {
+  // Real app sends outlet_impression_v2 + outlet_impression in pairs, staggered across
+  // 3-4 separate etracker POSTs per page (5 events each), not one big batch.
+  const batches = [];
+  const pairs = [];
   outlets.forEach((o, k) => {
     const idx = startIdx + k;
-    events.push(evOutletImpression(o, idx, v, i), evOutletImpressionV2(o, idx, v, i), evPromotionImpression(o, idx, v, i));
+    pairs.push(evOutletImpressionV2(o, idx, v, i), evOutletImpression(o, idx, v, i));
   });
-  return events;
+  for (let j = 0; j < pairs.length; j += 5) {
+    batches.push(pairs.slice(j, j + 5));
+  }
+  return batches;
 }
 
 // -- Supabase -----------------------------------------------------------------
@@ -941,13 +944,19 @@ function parseCards(outlets, nonFoodSet) {
         if (!json.searchToken) { stopReason = `no-token@${pagesDone}`; break; }
         searchToken = json.searchToken;
 
-        // Telemetry after each page (v3 verbatim)
+        // Telemetry after each page — matched to real app Proxyman trace:
+        //   POST 1: page_catalog (1 event)
+        //   POST 2-4: outlet_impression_v2 + outlet_impression pairs (5 events each)
+        //   Each POST staggered 200-500ms apart
         await sleep(150 + Math.random() * 200);
         et('et_page_catalog', [evPageCatalog(pagesDone, visitorId, deviceIdfv)]);
         const visible = outlets.slice(0, IMPRESSIONS_PER_PAGE);
         if (visible.length > 0) {
-          await sleep(500 + Math.random() * 900);
-          et('et_impressions', impressionTripletsBatch(visible, 0, visitorId, deviceIdfv));
+          const batches = impressionPairBatches(visible, 0, visitorId, deviceIdfv);
+          for (let bi = 0; bi < batches.length; bi++) {
+            await sleep(200 + Math.random() * 300);
+            et(`et_imp_${bi}`, batches[bi]);
+          }
         }
       }
       if (!stopReason) stopReason = `max-pages(${maxPages})`;
