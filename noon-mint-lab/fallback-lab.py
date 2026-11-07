@@ -448,16 +448,15 @@ def scrape_area(claim, ctx):
                     continue
                 return finish(kind_of(rst), rst, 'search', f'403 at page {pages_done + 1}, remint failed', fail_page=pages_done + 1)
 
-            # 429: KEEP SAME DEVICE. Wait to see how long 429 lasts, then retry with token refresh.
+            # 429: KEEP SAME DEVICE. Wait 60s, retry. If 429 again within 2 pages, wait 120s.
             if st == 429:
                 token_age = int((time.time() - state['minted_at']) * 1000) if state['minted_at'] else 0
-                say(f'p{pages_done + 1}: 429 ({page_ms}ms) reqs={c.noon_req} token_age={token_age}ms — WAITING to measure cooldown...')
-                # Try waiting increasing intervals: 15s, 30s, 60s — same device, same IP
+                say(f'p{pages_done + 1}: 429 ({page_ms}ms) reqs={c.noon_req} token_age={token_age}ms — waiting 60s...')
                 recovered = False
-                for wait_s in [15, 30, 60]:
+                for wait_s in [60, 120]:
                     say(f'  waiting {wait_s}s (same device {c.dev[:8]})...')
                     time.sleep(wait_s)
-                    # Refresh token if it's near 300s
+                    # Refresh token if near 300s
                     if state['minted_at'] and (time.time() - state['minted_at']) > 250:
                         say(f'  token near expiry ({int(time.time() - state["minted_at"])}s), refreshing...')
                         rst = refresh_token()
@@ -468,7 +467,7 @@ def scrape_area(claim, ctx):
                             if mst != 200:
                                 say(f'  remint also failed: {mst}')
                                 continue
-                    # Retry the same search
+                    # Retry search
                     retry_t0 = time.time()
                     st2, txt2 = c.send(f'search_after_{wait_s}s', SEARCH_URL, c.base(sh_base), method='POST', body=json.dumps(body))
                     retry_ms = int((time.time() - retry_t0) * 1000)
@@ -477,16 +476,26 @@ def scrape_area(claim, ctx):
                         st, txt = st2, txt2
                         recovered = True
                         say(f'  RECOVERED after {wait_s}s wait!')
+                        # Watch for immediate re-429: if we get 429 again within 2 pages, escalate to 120s
+                        state['pages_since_429'] = 0
                         break
                     if st2 == 429:
                         search_429 += 1
-                        continue
+                        if wait_s == 60:
+                            say(f'  still 429 after 60s, escalating to 120s...')
+                            continue
+                        # After 120s still 429 — give up on this area
+                        break
                     if st2 == 403:
                         search_403 += 1
                         say(f'  switched to 403 after wait — need new identity')
+                        rst2, _ = remint_after_403(f'search_after_{wait_s}s')
+                        if rst2 == 200:
+                            recovered = True
+                            say(f'  RECOVERED via remint after 403')
                         break
                 if not recovered:
-                    return finish('rate_limited', 429, 'search', f'429 at page {pages_done + 1}, not recovered after 15+30+60s wait', fail_page=pages_done + 1)
+                    return finish('rate_limited', 429, 'search', f'429 at page {pages_done + 1}, not recovered after 60+120s wait', fail_page=pages_done + 1)
 
             if st == 404: stop_reason = f'404@{pages_done + 1}'; break
             if st != 200:
@@ -582,7 +591,7 @@ def main():
 
         areas_done += 1
         if areas_done < max_areas:
-            gap = 15 + random.random() * 60
+            gap = 120 + random.random() * 120  # 2-4 min between areas
             say(f'gap {gap:.0f}s before next area')
             time.sleep(gap)
 
