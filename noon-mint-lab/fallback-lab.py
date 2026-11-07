@@ -421,16 +421,13 @@ def scrape_area(claim, ctx):
                 sh_base[k] = str(v).lower() if isinstance(v, bool) else str(v)
         sh_base['x-ab-test'] = AB_TEST
 
+        token_expiry_logged = False
         while pages_done < max_pages:
-            # Token refresh if approaching 300s (refresh at 270-290s)
-            if state['minted_at']:
-                token_age = time.time() - state['minted_at']
-                if token_age > state['refresh_at']:
-                    say(f'TOKEN REFRESH at {int(token_age)}s (limit {int(state["refresh_at"])}s) reqs={c.noon_req}')
-                    st = refresh_token()
-                    if st != 200:
-                        return finish(kind_of(st), st, 'token_refresh', f'token refresh {st} at page {pages_done + 1}', fail_page=pages_done + 1)
-                    say(f'TOKEN REFRESHED OK | new age=0s reqs={c.noon_req}')
+            # Token expiry: real app does NOT refresh mid-scroll — Proxyman confirms zero whoami
+            # calls after initial mint. We just let the token ride until Noon rejects it.
+            if not token_expiry_logged and state['minted_at'] and (time.time() - state['minted_at']) > 290:
+                say(f'TOKEN AGE {int(time.time() - state["minted_at"])}s — NOT refreshing (real app never does)')
+                token_expiry_logged = True
 
             # Page gap (from config)
             if pages_done > 0:
@@ -477,17 +474,7 @@ def scrape_area(claim, ctx):
                             say(f'  remint failed: {mst}')
                     say(f'  waiting {wait_s}s (device {c.dev[:8]})...')
                     time.sleep(wait_s)
-                    # Refresh token if near expiry
-                    if state['minted_at'] and (time.time() - state['minted_at']) > token_refresh_s:
-                        say(f'  token near expiry ({int(time.time() - state["minted_at"])}s), refreshing...')
-                        rst = refresh_token()
-                        say(f'  token refresh: {rst}')
-                        if rst != 200:
-                            say(f'  token refresh failed, minting fresh...')
-                            mst, mstep = mint(f'429wait_remint_')
-                            if mst != 200:
-                                say(f'  remint also failed: {mst}')
-                                continue
+                    # No token refresh — real app never refreshes mid-session
                     # Retry search
                     retry_t0 = time.time()
                     st2, txt2 = c.send(f'search_after_{wait_s}s', SEARCH_URL, c.base(sh_base), method='POST', body=json.dumps(body))
