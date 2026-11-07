@@ -323,40 +323,43 @@ def scrape_area(claim, ctx):
     loc_h = {'x-experience': 'ecom', 'x-locale': 'en-ae', 'x-device-lat': str(lat), 'x-device-lng': str(lng), 'Content-Type': 'application/json'}
 
     def mint(tag):
+        """Fast mint: real app speed (~2-3s total), no artificial pauses."""
         nonlocal zone, mint_calls, mint_403
+        mint_t0 = time.time()
         st, _ = c.send(f'{tag}whoami', WHOAMI_URL, c.base({'x-whoami-request-id': str(uuid.uuid4())}))
         mint_calls += 1
         if st != 200:
             mint_403 += 1 if st in (403, 429) else 0
+            say(f'{tag}whoami: {st} ({int((time.time() - mint_t0) * 1000)}ms)')
             return st, f'{tag}whoami'
         state['minted_at'] = time.time(); state['refresh_at'] = new_refresh_at()
-        time.sleep(0.3 + random.random() * 0.3)
         c.et(f'et_{tag}launch', [ev_launch(c.vis, c.dev), ev_launch_info(c.vis, c.dev), ev_app_foreground(c.vis, c.dev)])
-        time.sleep(1.2 + random.random() * 0.8)
+        time.sleep(0.1 + random.random() * 0.15)
         st, _ = c.send(f'{tag}set_location', SET_LOC_URL, c.base(loc_h), method='POST',
                         body=json.dumps({'location': {'lat': lat, 'lng': lng}, 'lang': 'en'}))
         mint_calls += 1
         if st != 200:
             mint_403 += 1 if st in (403, 429) else 0
+            say(f'{tag}set_location: {st} ({int((time.time() - mint_t0) * 1000)}ms)')
             return st, f'{tag}set_location'
-        time.sleep(0.2 + random.random() * 0.3)
         c.et(f'et_{tag}location', [ev_location_fetch(c.vis, c.dev), ev_page_home(c.vis, c.dev)])
         if not zone:
-            time.sleep(0.8 + random.random() * 0.6)
+            time.sleep(0.1 + random.random() * 0.1)
             fd_h = {'x-experience': 'food', 'x-locale': 'en-ae', 'x-device-lat': str(lat), 'x-device-lng': str(lng),
                     'x-mp-country': 'ae', 'x-lat': str(round(lat * 1e7)), 'x-lng': str(round(lng * 1e7))}
             st, txt = c.send(f'{tag}fd_whoami', FD_WHOAMI_URL, c.base(fd_h))
             mint_calls += 1
             if st != 200:
                 mint_403 += 1 if st in (403, 429) else 0
+                say(f'{tag}fd_whoami: {st} ({int((time.time() - mint_t0) * 1000)}ms)')
                 return st, f'{tag}fd_whoami'
             try:
                 j = json.loads(txt)
                 zone = {k: v for k, v in (j.get('headers') or {}).items() if v is not None and not isinstance(v, (dict, list))}
             except Exception:
                 zone = {}
-        time.sleep(0.15 + random.random() * 0.25)
         c.et(f'et_{tag}zone', [ev_whoami_ab_config(zone, c.vis, c.dev), ev_selected_zone(zone, c.vis, c.dev)])
+        say(f'{tag}DONE in {int((time.time() - mint_t0) * 1000)}ms | reqs={c.noon_req}')
         return 200, None
 
     def remint_after_403(where):
@@ -374,95 +377,122 @@ def scrape_area(claim, ctx):
         return st, fstep
 
     try:
-        # --- warm-up ---
+        # --- warm-up (fast: no artificial pauses) ---
         sentry = sentry_preflight()
         c.send('etracker_init', ETRACKER_INIT, {'User-Agent': UA, 'Accept': '*/*', 'Connection': 'keep-alive'})
-        time.sleep(1.8 + random.random() * 0.6)
+        time.sleep(0.3 + random.random() * 0.2)
 
-        # --- mint ---
+        # --- mint (fast: real app speed) ---
         st, fstep = mint('mint_')
         if st == 403:
             st, fstep = remint_after_403(fstep)
         if st != 200:
             return finish(kind_of(st), st, fstep, f'{fstep} {st} (sentry={sentry})')
-        time.sleep(1.0 + random.random() * 1.0)
+        say(f'MINT OK in {int((time.time() - area_start) * 1000)}ms | dev={c.dev[:8]} reqs={c.noon_req}')
+        time.sleep(0.3 + random.random() * 0.3)
 
-        # --- pagination (this machine's own pace, no shared budget) ---
-        first_page = True
+        # --- pagination (fast: ~1s per page, real app scroll speed) ---
+        # Per-page verbose logging so you can see progress live
+        search_body = {'queryEntity': None, 'q': None, 'f': {}, 'contexts': [], 'withContent': True, 'excludeOutletCodes': [],
+                'limit': 60, 'scopes': None, 'page': 1, 'dishTags': [], 'ratingMin': None,
+                'sort': {'by': 'popularity', 'dir': 'desc', 'slab': None}, 'widgets': None, 'content': None,
+                'withHits': False, 'filteredByWidget': None, 'internalFilteredByWidget': 'homepage_navpill_filters_widget',
+                'getFallback': True, 'type': 'outlet', 'qType': 'search_query', 'minCount': 0,
+                'groupDishes': False, 'isSsc': False, 'hideSearchBar': False, 'hideSearchOptions': False,
+                'isOutletAdProcessingEnabled': True, 'withDishFetchQuery': None}
+        sh_base = {'x-experience': 'food', 'x-locale': 'en-ae', 'x-device-lat': str(lat), 'x-device-lng': str(lng),
+              'x-mp-country': 'ae', 'x-lat': str(round(lat * 1e7)), 'x-lng': str(round(lng * 1e7)),
+              'x-border-enabled': 'true', 'x-rocket-enabled': 'true', 'Content-Type': 'application/json'}
+        for k, v in zone.items():
+            if v is not None and not isinstance(v, (dict, list)):
+                sh_base[k] = str(v).lower() if isinstance(v, bool) else str(v)
+        sh_base['x-ab-test'] = AB_TEST
+
         while pages_done < max_pages:
-            # Pace: persona gap only. No permit() call, no shared anything.
-            if not first_page:
-                gap = pace_lo + random.random() * max(0.0, pace_hi - pace_lo)
-                # Token refresh if due during the gap
-                due = state['minted_at'] + state['refresh_at'] - time.time()
-                if due < gap:
-                    time.sleep(max(0.0, due))
+            # Token refresh if approaching 300s (refresh at 270-290s)
+            if state['minted_at']:
+                token_age = time.time() - state['minted_at']
+                if token_age > state['refresh_at']:
+                    say(f'TOKEN REFRESH at {int(token_age)}s (limit {int(state["refresh_at"])}s) reqs={c.noon_req}')
                     st = refresh_token()
                     if st != 200:
                         return finish(kind_of(st), st, 'token_refresh', f'token refresh {st} at page {pages_done + 1}', fail_page=pages_done + 1)
-                    remaining = max(0.0, gap - max(0.0, due)) + 0.6 + random.random() * 1.2
-                    time.sleep(remaining)
-                else:
-                    time.sleep(gap)
-            first_page = False
+                    say(f'TOKEN REFRESHED OK | new age=0s reqs={c.noon_req}')
 
-            body = {'queryEntity': None, 'q': None, 'f': {}, 'contexts': [], 'withContent': True, 'excludeOutletCodes': [],
-                    'limit': 60, 'scopes': None, 'page': 1, 'dishTags': [], 'ratingMin': None,
-                    'sort': {'by': 'popularity', 'dir': 'desc', 'slab': None}, 'widgets': None, 'content': None,
-                    'withHits': False, 'filteredByWidget': None, 'internalFilteredByWidget': 'homepage_navpill_filters_widget',
-                    'getFallback': True, 'type': 'outlet', 'qType': 'search_query', 'minCount': 0,
-                    'groupDishes': False, 'isSsc': False, 'hideSearchBar': False, 'hideSearchOptions': False,
-                    'isOutletAdProcessingEnabled': True, 'withDishFetchQuery': None}
+            # Page gap: ~1-2s like a real user scrolling (not 6-30s persona pacing)
+            if pages_done > 0:
+                time.sleep(0.8 + random.random() * 1.2)
+
+            # Search
+            body = dict(search_body)
             if token: body['searchToken'] = token
-            sh = {'x-experience': 'food', 'x-locale': 'en-ae', 'x-device-lat': str(lat), 'x-device-lng': str(lng),
-                  'x-mp-country': 'ae', 'x-lat': str(round(lat * 1e7)), 'x-lng': str(round(lng * 1e7)),
-                  'x-border-enabled': 'true', 'x-rocket-enabled': 'true', 'Content-Type': 'application/json'}
-            for k, v in zone.items():
-                if v is not None and not isinstance(v, (dict, list)):
-                    sh[k] = str(v).lower() if isinstance(v, bool) else str(v)
-            sh['x-ab-test'] = AB_TEST
-            st, txt = c.send('search', SEARCH_URL, c.base(sh), method='POST', body=json.dumps(body))
+            page_t0 = time.time()
+            st, txt = c.send('search', SEARCH_URL, c.base(sh_base), method='POST', body=json.dumps(body))
+            page_ms = int((time.time() - page_t0) * 1000)
 
-            # Flaky response: one patient retry (this machine only)
+            # Flaky response: one retry
             if st in (None, 502, 503, 504):
-                time.sleep(3 + random.random() * 2)
-                st, txt = c.send('search_retry1', SEARCH_URL, c.base(sh), method='POST', body=json.dumps(body))
+                say(f'p{pages_done + 1}: {st} ({page_ms}ms) — retrying once')
+                time.sleep(2 + random.random() * 1)
+                st, txt = c.send('search_retry1', SEARCH_URL, c.base(sh_base), method='POST', body=json.dumps(body))
+                page_ms = int((time.time() - page_t0) * 1000)
 
             if st == 403: search_403 += 1
             if st == 429: search_429 += 1
 
-            if state.pop('await_429_result', False):
-                state['after_remint429'].append(st)
-                if st == 200: state['remint429_ok'] += 1
-
-            # 403: this machine gets a new identity and retries
+            # 403: new identity and retry
             if st == 403:
+                say(f'p{pages_done + 1}: 403 ({page_ms}ms) reqs={c.noon_req} token_age={int((time.time() - state["minted_at"]) * 1000)}ms')
                 rst, _ = remint_after_403(f'search p{pages_done + 1}')
                 if rst == 200:
-                    first_page = True
                     continue
+                return finish(kind_of(rst), rst, 'search', f'403 at page {pages_done + 1}, remint failed', fail_page=pages_done + 1)
 
-            # 429: this machine alone pauses briefly, then gets new identity + token
-            if st == 429 and state['remints_429'] < int(claim.get('remints_429') or 3):
-                state['remints_429'] += 1
-                old = c.dev[:8]
-                c.new_identity()
-                say(f'429 at search p{pages_done + 1}: new identity #{state["remints_429"]} ({old} -> {c.dev[:8]})'
-                    f' — this machine only | reqs={c.noon_req} token_age={int((time.time() - state["minted_at"]) * 1000) if state["minted_at"] else "?"}ms')
-                # Brief pause for THIS machine only (like a user closing and reopening the app)
-                time.sleep(5 + random.random() * 5)
-                mst, mstep = mint(f'r429_{state["remints_429"]}_')
-                if mst == 403:
-                    mst, mstep = remint_after_403(mstep)
-                if mst != 200:
-                    return finish(kind_of(mst), mst, mstep, f'mint after 429 failed: {mstep} {mst}', fail_page=pages_done + 1)
-                state['await_429_result'] = True
-                first_page = True
-                continue
+            # 429: KEEP SAME DEVICE. Wait to see how long 429 lasts, then retry with token refresh.
+            if st == 429:
+                token_age = int((time.time() - state['minted_at']) * 1000) if state['minted_at'] else 0
+                say(f'p{pages_done + 1}: 429 ({page_ms}ms) reqs={c.noon_req} token_age={token_age}ms — WAITING to measure cooldown...')
+                # Try waiting increasing intervals: 15s, 30s, 60s — same device, same IP
+                recovered = False
+                for wait_s in [15, 30, 60]:
+                    say(f'  waiting {wait_s}s (same device {c.dev[:8]})...')
+                    time.sleep(wait_s)
+                    # Refresh token if it's near 300s
+                    if state['minted_at'] and (time.time() - state['minted_at']) > 250:
+                        say(f'  token near expiry ({int(time.time() - state["minted_at"])}s), refreshing...')
+                        rst = refresh_token()
+                        say(f'  token refresh: {rst}')
+                        if rst != 200:
+                            say(f'  token refresh failed, minting fresh...')
+                            mst, mstep = mint(f'429wait_remint_')
+                            if mst != 200:
+                                say(f'  remint also failed: {mst}')
+                                continue
+                    # Retry the same search
+                    retry_t0 = time.time()
+                    st2, txt2 = c.send(f'search_after_{wait_s}s', SEARCH_URL, c.base(sh_base), method='POST', body=json.dumps(body))
+                    retry_ms = int((time.time() - retry_t0) * 1000)
+                    say(f'  after {wait_s}s: {st2} ({retry_ms}ms) reqs={c.noon_req}')
+                    if st2 == 200:
+                        st, txt = st2, txt2
+                        recovered = True
+                        say(f'  RECOVERED after {wait_s}s wait!')
+                        break
+                    if st2 == 429:
+                        search_429 += 1
+                        continue
+                    if st2 == 403:
+                        search_403 += 1
+                        say(f'  switched to 403 after wait — need new identity')
+                        break
+                if not recovered:
+                    return finish('rate_limited', 429, 'search', f'429 at page {pages_done + 1}, not recovered after 15+30+60s wait', fail_page=pages_done + 1)
 
             if st == 404: stop_reason = f'404@{pages_done + 1}'; break
             if st != 200:
+                say(f'p{pages_done + 1}: {st} ({page_ms}ms) — stopping')
                 return finish(kind_of(st), st, 'search', f'search {st} at page {pages_done + 1}', fail_page=pages_done + 1)
+
             try: j = json.loads(txt)
             except Exception: stop_reason = f'bad-json@{pages_done + 1}'; break
             outlets = walk_outlets(j.get('results'))
@@ -470,18 +500,23 @@ def scrape_area(claim, ctx):
             fresh = 0
             for o in outlets:
                 if o['outletCode'] not in seen: seen.add(o['outletCode']); captures.append(o); fresh += 1
+
+            # PER-PAGE LOG: every single page visible in the Actions log
+            token_age = int((time.time() - state['minted_at']) * 1000) if state['minted_at'] else 0
+            elapsed = int((time.time() - area_start) * 1000)
+            say(f'p{pages_done}: {len(outlets)} outlets (+{fresh} new, {len(seen)} total) {page_ms}ms | reqs={c.noon_req} token_age={token_age}ms elapsed={elapsed}ms')
+
             if not outlets: stop_reason = f'empty@{pages_done}'; break
             if fresh == 0: stop_reason = f'no-new@{pages_done}'; break
             if not j.get('searchToken'): stop_reason = f'no-token@{pages_done}'; break
             token = j['searchToken']
-            # Telemetry after each page
-            time.sleep(0.15 + random.random() * 0.2)
+
+            # Telemetry after each page (fast: minimal pauses)
             c.et('et_page_catalog', [ev_page_catalog(pages_done, c.vis, c.dev)])
             visible = outlets[:imp_n]
             if visible:
-                time.sleep(0.5 + random.random() * 0.9)
+                time.sleep(0.1 + random.random() * 0.2)
                 c.et('et_impressions', impression_triplets(visible, c.vis, c.dev))
-            if pages_done % 10 == 0: say(f'p{pages_done}: {len(seen)} cards so far')
         if not stop_reason: stop_reason = f'max-pages({max_pages})'
         return finish('ok')
     except Exception as e:
