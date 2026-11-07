@@ -290,9 +290,33 @@ def scrape_area(claim, ctx):
 
     say(f"=== AREA {area_name} id={area_id} | persona={ctx['persona']} | dev={c.dev[:8]} ===")
 
-    def finish(kind, status=None, step=None, err=None):
-        say(f"area {area_name}: {kind}{f' ({status} @ {step})' if kind != 'ok' else ''} pages={pages_done} cards={len(captures)}")
-        return kind, status
+    def finish(kind, status=None, step=None, err=None, fail_page=None):
+        token_age = int((time.time() - state['minted_at']) * 1000) if state['minted_at'] else None
+        elapsed = int((time.time() - area_start) * 1000)
+        result = {
+            'outcome': kind, 'fail_step': step, 'http_status': status, 'error': (err or '')[:500] or None,
+            'fail_page': fail_page,
+            'pages_done': pages_done, 'cards': len(captures), 'stop_reason': stop_reason,
+            'setup_ms': int((state['minted_at'] - area_start) * 1000) if state['minted_at'] else None,
+            'elapsed_ms': elapsed, 'token_age_ms': token_age,
+            'requests': c.noon_req,  # total Noon requests this machine made for this area
+            'device_id': dev_start[:8],
+            'device_id_end': c.dev[:8],
+            'search_403': search_403, 'search_429': search_429,
+            'mint_calls': mint_calls, 'mint_403': mint_403,
+            'remints': state['remints'], 'refreshes': state['refreshes'],
+            'remints_429': state['remints_429'], 'remint429_ok': state['remint429_ok'],
+            'after_remint429': state['after_remint429'],
+            'et_posts': c.et_posts, 'et_events': c.et_events, 'et_non2xx': c.et_non2xx,
+            'persona': ctx['persona'], 'pace': f"{pace_lo}-{pace_hi}",
+            'flow': 'fallback-lab', 'http_protocol': 'curl_cffi_safari15_3',
+            'cookies': c.log,  # full request log: every request with step, status, ms, timestamp
+        }
+        say(f"area {area_name}: {kind}{f' ({status} @ {step})' if kind != 'ok' else ''}"
+            f" pages={pages_done} cards={len(captures)} reqs={c.noon_req}"
+            f" token_age={token_age}ms remints={state['remints']} r429={state['remints_429']}"
+            f" elapsed={elapsed}ms")
+        return result
 
     def kind_of(st): return 'rate_limited' if st == 429 else 'blocked' if st == 403 else 'error'
 
@@ -375,7 +399,7 @@ def scrape_area(claim, ctx):
                     time.sleep(max(0.0, due))
                     st = refresh_token()
                     if st != 200:
-                        return finish(kind_of(st), st, 'token_refresh', f'token refresh {st} at page {pages_done + 1}')
+                        return finish(kind_of(st), st, 'token_refresh', f'token refresh {st} at page {pages_done + 1}', fail_page=pages_done + 1)
                     remaining = max(0.0, gap - max(0.0, due)) + 0.6 + random.random() * 1.2
                     time.sleep(remaining)
                 else:
@@ -423,21 +447,22 @@ def scrape_area(claim, ctx):
                 state['remints_429'] += 1
                 old = c.dev[:8]
                 c.new_identity()
-                say(f'429 at search p{pages_done + 1}: new identity #{state["remints_429"]} ({old} -> {c.dev[:8]}) — this machine only')
+                say(f'429 at search p{pages_done + 1}: new identity #{state["remints_429"]} ({old} -> {c.dev[:8]})'
+                    f' — this machine only | reqs={c.noon_req} token_age={int((time.time() - state["minted_at"]) * 1000) if state["minted_at"] else "?"}ms')
                 # Brief pause for THIS machine only (like a user closing and reopening the app)
                 time.sleep(5 + random.random() * 5)
                 mst, mstep = mint(f'r429_{state["remints_429"]}_')
                 if mst == 403:
                     mst, mstep = remint_after_403(mstep)
                 if mst != 200:
-                    return finish(kind_of(mst), mst, mstep, f'mint after 429 failed: {mstep} {mst}')
+                    return finish(kind_of(mst), mst, mstep, f'mint after 429 failed: {mstep} {mst}', fail_page=pages_done + 1)
                 state['await_429_result'] = True
                 first_page = True
                 continue
 
             if st == 404: stop_reason = f'404@{pages_done + 1}'; break
             if st != 200:
-                return finish(kind_of(st), st, 'search', f'search {st} at page {pages_done + 1}')
+                return finish(kind_of(st), st, 'search', f'search {st} at page {pages_done + 1}', fail_page=pages_done + 1)
             try: j = json.loads(txt)
             except Exception: stop_reason = f'bad-json@{pages_done + 1}'; break
             outlets = walk_outlets(j.get('results'))
@@ -511,14 +536,9 @@ def main():
 
         ctx['area_seq'] += 1
         say(f'area {areas_done + 1}/{max_areas}: {claim.get("area_name")} id={claim["noon_area_id"]}')
-        kind, st = scrape_area(claim, ctx)
+        result = scrape_area(claim, ctx)
 
-        # Report to lab
-        result = {
-            'outcome': kind, 'pages_done': 0, 'cards': 0, 'setup_ms': 0,
-            'elapsed_ms': 0, 'device_id': '', 'flow': 'fallback-lab',
-            'http_protocol': 'curl_cffi_safari15_3',
-        }
+        # Report to lab — full result with all diagnostics
         try:
             rpc('noon_lab_report', {'p_test_id': TEST_ID, 'p_machine_no': MACHINE,
                                      'p_item_id': claim.get('item_id'), 'p_result': result})
