@@ -560,7 +560,7 @@ def scrape_area(claim, ctx):
 
 def main():
     global PROXY, RUNNER_IP
-    if not (SUPABASE_URL and SUPABASE_KEY and TEST_ID and MACHINE and FLEET in ('uae', 'decodo')):
+    if not (SUPABASE_URL and SUPABASE_KEY and TEST_ID and MACHINE and FLEET in ('uae', 'decodo', 'dc_free')):
         say('missing env (SUPABASE_URL/KEY, TEST_ID, MACHINE_NO, FLEET)'); sys.exit(1)
     PROXY = pick_proxy()
     if not PROXY:
