@@ -62,12 +62,17 @@ def rpc(name, params):
     return _req('POST', f'/rest/v1/rpc/{name}', params)
 
 def dc_slot():
-    """1-based position of this machine among the run's DC machines, wrapped at fb_dc_machines."""
+    """DC slot (1..fb_dc_machines) of this machine. Supabase stores it in run_machine.proxy_port (2026-11-08),
+    so a replacement reuses the slot (= the same 8 IPs) of the machine it replaces. Older rows without it fall
+    back to this machine's position among the run's DC machines."""
     rows = _req('GET', f'/rest/v1/noon_ranking_run_machine?run_id=eq.{RUN_ID}&fleet=eq.dc'
-                       f'&select=machine_no&order=machine_no.asc') or []
+                       f'&select=machine_no,proxy_port&order=machine_no.asc') or []
     nos = [r['machine_no'] for r in rows]
     if MACHINE_NO not in nos:
         return None, len(nos)
+    own = rows[nos.index(MACHINE_NO)].get('proxy_port')
+    if own:
+        return int(own), len(nos)
     st = (_req('GET', '/rest/v1/noon_ranking_settings?id=eq.1&select=fb_dc_machines') or [{}])[0]
     fleet_size = int(st.get('fb_dc_machines') or len(nos) or 1)
     return (nos.index(MACHINE_NO) % fleet_size) + 1, len(nos)
