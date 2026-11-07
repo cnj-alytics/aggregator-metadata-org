@@ -258,10 +258,10 @@ def egress_ip():
 # -- One area -------------------------------------------------------------------
 
 def scrape_area(claim, ctx):
-    """Returns (kind, http_status). Each machine handles its own 429/403 independently."""
+    """Returns result dict. Each machine handles its own 429/403 independently.
+    All tuning knobs come from claim['config'] (set on noon_lab.test.config in Supabase)."""
     area_id = claim['noon_area_id']; area_name = claim.get('area_name') or str(area_id)
     lat, lng = float(claim['lat']), float(claim['lng'])
-    max_pages = int(claim.get('max_pages') or 120)
     zone = dict(claim.get('zone_headers') or {})
     c = Customer()
     area_start = time.time()
@@ -271,14 +271,25 @@ def scrape_area(claim, ctx):
     state = {'minted_at': None, 'refresh_at': 280.0, 'refreshes': 0, 'remints': 0,
              'remints_429': 0, 'remint429_ok': 0, 'after_remint429': []}
     dev_start = c.dev
+
+    # --- CONFIG (all from Supabase noon_lab.test.config JSONB) ---
+    cfg = claim.get('config') or {}
+    max_pages      = int(cfg.get('max_pages', 999))
+    max_requests   = int(cfg.get('max_requests', 999))
+    page_gap_lo    = float(cfg.get('page_gap_lo', 0.8))       # seconds between pages
+    page_gap_hi    = float(cfg.get('page_gap_hi', 2.0))
+    wait_429       = cfg.get('wait_429', [120])                # wait seconds on 429 (array, tried in order)
+    send_etracker  = bool(cfg.get('send_etracker', True))
+    mint_on_429    = bool(cfg.get('mint_on_429', False))       # new device on 429 vs keep same
+    token_refresh_s = float(cfg.get('token_refresh_s', 250))   # refresh token after N seconds
     imp_n = int(ctx.get('impressions_per_page') or 6)
 
-    # Pacing: this machine's persona decides the gap. No shared budget.
-    pace_lo, pace_hi = ctx['pace']
+    say(f'CONFIG: pages<={max_pages} reqs<={max_requests} gap={page_gap_lo}-{page_gap_hi}s '
+        f'429_wait={wait_429} etracker={send_etracker} mint_on_429={mint_on_429} '
+        f'token_refresh={token_refresh_s}s')
 
     def new_refresh_at():
-        lo, hi = float(claim.get('refresh_min_s') or 270), float(claim.get('refresh_max_s') or 290)
-        return lo + random.random() * max(0.0, hi - lo)
+        return token_refresh_s + random.random() * 20
 
     def refresh_token():
         st, _ = c.send('token_refresh', WHOAMI_URL, c.base({'x-whoami-request-id': str(uuid.uuid4())}))
@@ -419,9 +430,9 @@ def scrape_area(claim, ctx):
                         return finish(kind_of(st), st, 'token_refresh', f'token refresh {st} at page {pages_done + 1}', fail_page=pages_done + 1)
                     say(f'TOKEN REFRESHED OK | new age=0s reqs={c.noon_req}')
 
-            # Page gap: ~1-2s like a real user scrolling (not 6-30s persona pacing)
+            # Page gap (from config)
             if pages_done > 0:
-                time.sleep(0.8 + random.random() * 1.2)
+                time.sleep(page_gap_lo + random.random() * max(0, page_gap_hi - page_gap_lo))
 
             # Search
             body = dict(search_body)
@@ -448,16 +459,24 @@ def scrape_area(claim, ctx):
                     continue
                 return finish(kind_of(rst), rst, 'search', f'403 at page {pages_done + 1}, remint failed', fail_page=pages_done + 1)
 
-            # 429: KEEP SAME DEVICE. Wait 60s, retry. If 429 again within 2 pages, wait 120s.
+            # 429: configurable wait strategy from config.wait_429
             if st == 429:
                 token_age = int((time.time() - state['minted_at']) * 1000) if state['minted_at'] else 0
-                say(f'p{pages_done + 1}: 429 ({page_ms}ms) reqs={c.noon_req} token_age={token_age}ms — waiting 60s...')
+                say(f'p{pages_done + 1}: 429 ({page_ms}ms) reqs={c.noon_req} token_age={token_age}ms — wait_429={wait_429}')
                 recovered = False
-                for wait_s in [60, 120]:
-                    say(f'  waiting {wait_s}s (same device {c.dev[:8]})...')
+                for wait_s in wait_429:
+                    wait_s = int(wait_s)
+                    if mint_on_429:
+                        old = c.dev[:8]
+                        c.new_identity()
+                        say(f'  429 mint_on_429: new device {old} -> {c.dev[:8]}')
+                        mst, mstep = mint(f'429remint_')
+                        if mst != 200:
+                            say(f'  remint failed: {mst}')
+                    say(f'  waiting {wait_s}s (device {c.dev[:8]})...')
                     time.sleep(wait_s)
-                    # Refresh token if near 300s
-                    if state['minted_at'] and (time.time() - state['minted_at']) > 250:
+                    # Refresh token if near expiry
+                    if state['minted_at'] and (time.time() - state['minted_at']) > token_refresh_s:
                         say(f'  token near expiry ({int(time.time() - state["minted_at"])}s), refreshing...')
                         rst = refresh_token()
                         say(f'  token refresh: {rst}')
@@ -476,16 +495,11 @@ def scrape_area(claim, ctx):
                         st, txt = st2, txt2
                         recovered = True
                         say(f'  RECOVERED after {wait_s}s wait!')
-                        # Watch for immediate re-429: if we get 429 again within 2 pages, escalate to 120s
-                        state['pages_since_429'] = 0
                         break
                     if st2 == 429:
                         search_429 += 1
-                        if wait_s == 60:
-                            say(f'  still 429 after 60s, escalating to 120s...')
-                            continue
-                        # After 120s still 429 — give up on this area
-                        break
+                        say(f'  still 429 after {wait_s}s, trying next wait...')
+                        continue
                     if st2 == 403:
                         search_403 += 1
                         say(f'  switched to 403 after wait — need new identity')
@@ -495,7 +509,8 @@ def scrape_area(claim, ctx):
                             say(f'  RECOVERED via remint after 403')
                         break
                 if not recovered:
-                    return finish('rate_limited', 429, 'search', f'429 at page {pages_done + 1}, not recovered after 60+120s wait', fail_page=pages_done + 1)
+                    waits_str = '+'.join(str(int(w)) for w in wait_429)
+                    return finish('rate_limited', 429, 'search', f'429 at page {pages_done + 1}, not recovered after {waits_str}s wait', fail_page=pages_done + 1)
 
             if st == 404: stop_reason = f'404@{pages_done + 1}'; break
             if st != 200:
@@ -520,12 +535,19 @@ def scrape_area(claim, ctx):
             if not j.get('searchToken'): stop_reason = f'no-token@{pages_done}'; break
             token = j['searchToken']
 
-            # Telemetry after each page (fast: minimal pauses)
-            c.et('et_page_catalog', [ev_page_catalog(pages_done, c.vis, c.dev)])
-            visible = outlets[:imp_n]
-            if visible:
-                time.sleep(0.1 + random.random() * 0.2)
-                c.et('et_impressions', impression_triplets(visible, c.vis, c.dev))
+            # Telemetry after each page (configurable)
+            if send_etracker:
+                c.et('et_page_catalog', [ev_page_catalog(pages_done, c.vis, c.dev)])
+                visible = outlets[:imp_n]
+                if visible:
+                    time.sleep(0.1 + random.random() * 0.2)
+                    c.et('et_impressions', impression_triplets(visible, c.vis, c.dev))
+
+            # Check max_requests limit
+            if c.noon_req >= max_requests:
+                stop_reason = f'max-requests({max_requests})@p{pages_done}'
+                say(f'HIT max_requests={max_requests} at page {pages_done}')
+                break
         if not stop_reason: stop_reason = f'max-pages({max_pages})'
         return finish('ok')
     except Exception as e:
@@ -555,17 +577,12 @@ def main():
     tel = (spec.get('telemetry') if isinstance(spec, dict) else None) or {}
     lo, hi = int(tel.get('impressions_per_page_min') or 4), int(tel.get('impressions_per_page_max') or 10)
 
-    # Persona: each machine picks its own independently
-    weights = {'scroller': 25, 'browser': 55, 'reader': 20}
-    paces = {'scroller': [2, 6], 'browser': [6, 15], 'reader': [15, 30]}
-    names = list(weights.keys())
-    persona = random.choices(names, weights=[weights[n] for n in names])[0]
-    plo, phi = paces[persona]
-    say(f'persona {persona} (page gap {plo}-{phi}s) | impressions {lo}-{hi}')
+    say(f'impressions {lo}-{hi}')
 
     ctx = {'non_food': set(), 'dry_run': True, 'scrape_date': None, 'scrape_hour': None,
-           'area_seq': 0, 'last_gap_s': 0, 'persona': persona, 'pace': (float(plo), float(phi)),
-           'impressions_per_page': random.randint(min(lo, hi), max(lo, hi))}
+           'area_seq': 0, 'last_gap_s': 0, 'persona': 'config-driven', 'pace': (0.8, 2.0),
+           'impressions_per_page': random.randint(min(lo, hi), max(lo, hi)),
+           'last_config': {}}
 
     # Area loop: claim from noon_lab
     areas_done = 0
@@ -578,6 +595,8 @@ def main():
         if not claim or claim.get('stop') or claim.get('noon_area_id') is None:
             say(f'no more areas: {(claim or {}).get("reason", "done")}'); break
 
+        cfg = claim.get('config') or {}
+        ctx['last_config'] = cfg
         ctx['area_seq'] += 1
         say(f'area {areas_done + 1}/{max_areas}: {claim.get("area_name")} id={claim["noon_area_id"]}')
         result = scrape_area(claim, ctx)
@@ -591,8 +610,10 @@ def main():
 
         areas_done += 1
         if areas_done < max_areas:
-            gap = 120 + random.random() * 120  # 2-4 min between areas
-            say(f'gap {gap:.0f}s before next area')
+            area_gap_s = float(cfg.get('area_gap_s', 120))
+            area_gap_rand = float(cfg.get('area_gap_rand_s', area_gap_s))
+            gap = area_gap_s + random.random() * area_gap_rand
+            say(f'gap {gap:.0f}s before next area (config: {area_gap_s}+rand({area_gap_rand}))')
             time.sleep(gap)
 
     say(f'=== done: {areas_done} areas ===')
