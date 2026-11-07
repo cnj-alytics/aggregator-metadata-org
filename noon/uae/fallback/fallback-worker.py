@@ -128,19 +128,17 @@ def ev_whoami_ab_config(zh, v, i):
     elif isinstance(raw, list): ids = [x for x in raw if isinstance(x, int) and not isinstance(x, bool)]
     return evt('whoami_ab_config', {'abIds': ids or [1052, 1471, 1531, 1731, 1750], **noon_app()}, v, i)
 def ev_page_catalog(pn, v, i): return evt('page_catalog', {'hid': str(uuid.uuid4()), 'nbh': 60, 'pn': pn, 'sb': 'browse', **food_app()}, v, i)
-def impression_triplets(outlets, v, i):
+def impression_pairs(outlets, v, i):
+    """Lab-proven pattern: staggered v2+v1 pairs only (no promotion_impression).
+    Matches real Noon app behaviour confirmed via Proxyman capture."""
     events = []
     for idx, o in enumerate(outlets):
         oc = o.get('outletCode'); df = o.get('distance') or 5.0; sla = o.get('sla') or '30-40'
-        events.append(evt('outlet_impression', {'oc': oc, 'wid': f'search_outlet/{idx}', 'aid': oc, 'ix': f'0/{idx}', 'otg': False,
-                          'df': df, 'fav': False, 'isp': True, 'sla': sla, 'wn': 'search_results', 'wtc': 'search_results_tab',
-                          'curl': '/search?type=outlet', 'src': 'search/results', 'pn': 'Search_Results', **food_app()}, v, i))
         events.append(evt('outlet_impression_v2', {'pg': 'SR', 'wt': f'SR/search_results/0/search_results_tab/{idx}/ROW/{idx}/ITM/0',
-                          'ul': '/search?type=outlet', 'cf': '{}', 'isp': True, 'oc': oc, 'df': df, 'sla': sla, **food_app()}, v, i))
-        events.append(evt('promotion_impression', {'aid': oc, 'wid': f'search_results/{idx}', 'aidMap': {oc: f'search_results/{idx}'},
-                          'ismMap': {oc: True}, 'curl': '/search?type=outlet', 'toUrl': f'/outlet/{oc}',
-                          'ed': {'eIds': [], 'reqId': str(uuid.uuid4())}, 'cmsEids': {}, 'wp': idx, 'ar': 100,
-                          'adType': 'display', 'isAd': False, **food_app()}, v, i))
+                          'ul': '/search?type=outlet', 'cf': '{}', 'oc': oc, 'df': df, 'sla': sla, **food_app()}, v, i))
+        events.append(evt('outlet_impression', {'oc': oc, 'wid': f'search_outlet/{idx}', 'aid': oc, 'ix': f'0/{idx}', 'otg': False,
+                          'df': df, 'fav': False, 'isp': False, 'sla': sla, 'wn': 'search_results', 'wtc': 'search_results_tab',
+                          'curl': '/search?type=outlet', 'src': 'search/results', 'pn': 'Home_page', **food_app()}, v, i))
     return events
 
 # -- Supabase (direct, never through the proxy) ---------------------------------
@@ -424,24 +422,14 @@ def scrape_area(claim, ctx):
     stop_reason, search_403, search_429, et_posts, et_events, et_non2xx = None, 0, 0, 0, 0, 0
     mint_calls, mint_403 = 0, 0
     resumed_from = 0
-    state = {'minted_at': None, 'refresh_at': 280.0, 'paused': False, 'refreshes': 0, 'remints': 0,
+    state = {'minted_at': None, 'paused': False, 'remints': 0,
              'remints_429': 0, 'remint429_ok': 0, 'after_remint429': []}
     on_429 = str(claim.get('on_429') or 'pause')  # Supabase: 'remint' = new device + new token on a search 429
     dev_start = c.dev
     imp_n = int(ctx.get('impressions_per_page') or 6)
 
-    def new_refresh_at():  # guest token lives 300 s: refresh close to it (Supabase window, default 270-290 s)
-        lo, hi = float(claim.get('refresh_min_s') or 270), float(claim.get('refresh_max_s') or 290)
-        return lo + random.random() * max(0.0, hi - lo)
-
-    def refresh_token():
-        """whoami with the current session before the 300 s expiry; a 403 mints a new token. Returns status."""
-        st, _ = send429('token_refresh', WHOAMI_URL, lambda: c.base({'x-whoami-request-id': str(uuid.uuid4())}))
-        if st == 403:
-            st, _ = remint_after_403('token_refresh')
-        elif st == 200:
-            state['minted_at'] = time.time(); state['refresh_at'] = new_refresh_at(); state['refreshes'] += 1
-        return st
+    # Token refresh REMOVED: Proxyman confirmed the real Noon app never refreshes
+    # the guest token mid-session. Refreshing was triggering 429s.
 
     def send429(step, url, headers_fn, method='GET', body=None):
         """One 30 s pause per area on a 429 (the whole IP backs off via Supabase), then one retry."""
@@ -453,15 +441,6 @@ def scrape_area(claim, ctx):
             w = permit(int(claim.get('pause_429_s') or 30))
             say(f'429 at {step}: pausing {w:.0f}s (whole IP) then one retry')
             w = w + random.random() * 3
-            # keep the token valid across the pause: refresh at its due time inside the pause (search only)
-            due = (state['minted_at'] + state['refresh_at'] - time.time()) if (step == 'search' and state['minted_at']) else None
-            if due is not None and due < w:
-                time.sleep(max(0.0, due))
-                t_ref = time.time()
-                rst = refresh_token()
-                if rst != 200:
-                    return rst, ''
-                w = max(0.0, w - max(0.0, due) - (time.time() - t_ref)) + 0.6 + random.random() * 1.0
             time.sleep(w)
             st, txt = c.send(f'{step}_after429', url, headers_fn(), method=method, body=body)
             say(f'  after pause: {step} -> {st}')
@@ -504,19 +483,19 @@ def scrape_area(claim, ctx):
         audit({
             'area_seq': ctx['area_seq'], 'noon_area_id': area_id, 'area_name': area_name,
             'claimed_at': now_iso(area_start), 'ended_at': now_iso(), 'gap_s': ctx['last_gap_s'],
-            'page_delay_ms': int(ctx['pace'][0] * 1000), 'max_pages': max_pages, 'token_no': 1 + state['refreshes'] + state['remints'],
-            'token_age_ms': int((time.time() - c.t0) * 1000), 'req_before': 0, 'req_area': c.noon_req,
+            'page_delay_ms': int(ctx['pace'][0] * 1000), 'max_pages': max_pages, 'token_no': 1 + state['remints'],
+            'token_age_ms': int((time.time() - (state['minted_at'] or c.t0)) * 1000), 'req_before': 0, 'req_area': c.noon_req,
             'elapsed_ms': int((time.time() - area_start) * 1000), 'outcome': kind, 'pages': pages_done,
             'cards': len(captures) if kind == 'ok' else None, 'rows_parsed': len(rows) if kind == 'ok' else None,
             'rows_saved': saved if kind == 'ok' else None,
             'fail_step': step, 'fail_page': fail_page, 'http_status': status, 'error': (err or '')[:300] or None,
             'stop_reason': (f"{stop_reason} fleet={FLEET}{':' + PROXY_PORT if PROXY_PORT else ''} persona={ctx['persona']} "
-                            f"pace={ctx['pace'][0]}-{ctx['pace'][1]}s resumed_from={resumed_from}"
+                            f"pace={ctx['pace'][0]}-{ctx['pace'][1]}s resumed_from={resumed_from} no_refresh"
                             f" r429={state['remints_429']} r429_ok={state['remint429_ok']} after={state['after_remint429']}") if kind == 'ok' else
                            f"fallback fleet={FLEET}{':' + PROXY_PORT if PROXY_PORT else ''} persona={ctx['persona']}"
                            f" r429={state['remints_429']} r429_ok={state['remint429_ok']} after={state['after_remint429']}",
             'rotations': state['remints'], 'recoveries': 1 if state['paused'] else 0, 'recoveries_ok': state.get('remint_ok', 0),
-            'remints': state['refreshes'],
+            'remints': 0,  # token refresh removed — real app never refreshes
             'search_403': search_403, 'search_429': search_429, 'et_posts': c.et_posts, 'et_events': c.et_events, 'et_non2xx': c.et_non2xx,
             'device_id_start': dev_start[:8], 'device_id_end': c.dev[:8], 'req_log': c.log,
             'zone_cached': zone_cached, 'mint_calls': mint_calls, 'mint_403': mint_403, 'mint_swaps': 0,
@@ -539,7 +518,7 @@ def scrape_area(claim, ctx):
         if st != 200:
             mint_403 += 1 if st in (403, 429) else 0
             return st, f'{tag}whoami'
-        state['minted_at'] = time.time(); state['refresh_at'] = new_refresh_at()
+        state['minted_at'] = time.time()
         time.sleep(0.3 + random.random() * 0.3)
         c.et(f'et_{tag}launch', [ev_launch(c.vis, c.dev), ev_launch_info(c.vis, c.dev), ev_app_foreground(c.vis, c.dev)])
         time.sleep(1.2 + random.random() * 0.8)
@@ -606,15 +585,7 @@ def scrape_area(claim, ctx):
             gap = 0.0 if first_page else ctx['pace'][0] + random.random() * max(0.0, ctx['pace'][1] - ctx['pace'][0])
             first_page = False
             wait = max(gap, permit())  # persona pace, but never faster than this IP's page budget
-            # The token is refreshed on time (270-290 s) even when that point falls inside this wait
-            due = state['minted_at'] + state['refresh_at'] - time.time()
-            if due < wait:
-                time.sleep(max(0.0, due))
-                t_ref = time.time()
-                st = refresh_token()
-                if st != 200:
-                    return finish(kind_of(st), st, 'token_refresh', f'token refresh {st} at page {pages_done + 1}', pages_done + 1)
-                wait = max(0.0, wait - max(0.0, due) - (time.time() - t_ref)) + 0.6 + random.random() * 1.2
+            # Token refresh REMOVED: real app never refreshes mid-session (Proxyman confirmed)
             time.sleep(max(0.0, wait))
             body = {'queryEntity': None, 'q': None, 'f': {}, 'contexts': [], 'withContent': True, 'excludeOutletCodes': [],
                     'limit': 60, 'scopes': None, 'page': 1, 'dishTags': [], 'ratingMin': None,
@@ -674,13 +645,14 @@ def scrape_area(claim, ctx):
             if fresh == 0: stop_reason = f'no-new@{pages_done}'; break
             if not j.get('searchToken'): stop_reason = f'no-token@{pages_done}'; break
             token = j['searchToken']
-            # Telemetry after each page, like the app (production): page_catalog + impressions of visible outlets
-            time.sleep(0.15 + random.random() * 0.2)
+            # Telemetry after each page: 2-POST pattern matching real app (Proxyman-confirmed)
+            # POST 1: page_catalog, POST 2: single batch of v2+v1 pairs (no promotion_impression)
+            time.sleep(0.3 + random.random() * 0.2)
             c.et('et_page_catalog', [ev_page_catalog(pages_done, c.vis, c.dev)])
             visible = outlets[:imp_n]
             if visible:
-                time.sleep(0.5 + random.random() * 0.9)
-                c.et('et_impressions', impression_triplets(visible, c.vis, c.dev))
+                time.sleep(0.3 + random.random() * 0.3)
+                c.et('et_impressions', impression_pairs(visible, c.vis, c.dev))
             if pages_done % 10 == 0: say(f'p{pages_done}: {len(seen)} cards so far')
         if not stop_reason: stop_reason = f'max-pages({max_pages})'
         return finish('ok')
@@ -692,7 +664,7 @@ def scrape_area(claim, ctx):
 
 def main():
     global PROXY, RUNNER_IP
-    if not (SUPABASE_URL and SUPABASE_KEY and RUN_ID and MACHINE and FLEET in ('uae', 'decodo')):
+    if not (SUPABASE_URL and SUPABASE_KEY and RUN_ID and MACHINE and FLEET in ('uae', 'decodo', 'dc')):
         say('missing env (SUPABASE_URL/KEY, RUN_ID, MACHINE_NO, FLEET)'); sys.exit(1)
     PROXY = pick_proxy()
     if not PROXY:
