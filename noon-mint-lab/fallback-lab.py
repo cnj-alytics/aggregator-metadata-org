@@ -44,7 +44,7 @@ P = f'[lab-fb t{TEST_ID} m{MACHINE} {FLEET}{":" + PROXY_PORT if PROXY_PORT else 
 def say(m): print(f'{P} {m}', flush=True)
 def now_iso(ts=None): return datetime.fromtimestamp(ts or time.time(), tz=timezone.utc).isoformat()
 
-# -- Proxy (never direct) -------------------------------------------------------
+# -- Proxy (never direct — fallback always uses UAE/Decodo) ---------------------
 
 def pick_proxy():
     raw = os.environ.get('NOON_PROXY_URL', '')
@@ -284,7 +284,7 @@ def scrape_area(claim, ctx):
     send_etracker  = bool(cfg.get('send_etracker', True))
     mint_on_429    = bool(cfg.get('mint_on_429', False))       # new device on 429 vs keep same
     token_refresh_s = float(cfg.get('token_refresh_s', 250))   # refresh token after N seconds
-    imp_n = int(ctx.get('impressions_per_page') or 6)
+    imp_n = int(cfg.get('impressions_per_page', 3))            # real app shows 2-4 on screen
 
     say(f'CONFIG: pages<={max_pages} reqs<={max_requests} gap={page_gap_lo}-{page_gap_hi}s '
         f'429_wait={wait_429} etracker={send_etracker} mint_on_429={mint_on_429} '
@@ -524,20 +524,26 @@ def scrape_area(claim, ctx):
             if not j.get('searchToken'): stop_reason = f'no-token@{pages_done}'; break
             token = j['searchToken']
 
-            # Telemetry after each page — staggered like real app:
-            #   POST 1: page_catalog (1 event)
-            #   POST 2: outlet_impression_v2 + outlet_impression pairs (5 events)
-            #   POST 3: more pairs (5 events)
-            #   POST 4: final pairs (2 events)
-            #   Each POST separated by 0.2-0.5s
+            # Telemetry — matched to real app rate: 2-3 etracker POSTs per page
+            #   POST 1: page_catalog (1 event) — 0.5s after search
+            #   POST 2: impression pairs for visible outlets (4-6 events) — 0.4s later
+            #   Real app: 3.2s total per page. With ~1s search + ~1.5s telemetry = ~1.7s dead time
             if send_etracker:
+                time.sleep(0.3 + random.random() * 0.2)
                 c.et('et_page_catalog', [ev_page_catalog(pages_done, c.vis, c.dev)])
                 visible = outlets[:imp_n]
                 if visible:
-                    batches = impression_pairs(visible, c.vis, c.dev)
-                    for bi, batch in enumerate(batches):
-                        time.sleep(0.2 + random.random() * 0.3)
-                        c.et(f'et_imp_{bi}', batch)
+                    # Single POST with all pairs (real app sometimes does 1, sometimes 2)
+                    all_pairs = []
+                    for idx, o in enumerate(visible):
+                        oc = o.get('outletCode'); df = o.get('distance') or 5.0; sla = o.get('sla') or '30-40'
+                        all_pairs.append(evt('outlet_impression_v2', {'pg': 'SR', 'wt': f'SR/search_results/0/search_results_tab/{idx}/ROW/{idx}/ITM/0',
+                                              'ul': '/search?type=outlet', 'cf': '{}', 'oc': oc, 'df': df, 'sla': sla, **food_app()}, c.vis, c.dev))
+                        all_pairs.append(evt('outlet_impression', {'aid': oc, 'wid': f'search_outlet/{idx}', 'oc': oc, 'ix': f'0/{idx}',
+                                              'df': df, 'fav': False, 'isp': False, 'sla': sla,
+                                              'curl': '/search?type=outlet', 'pn': 'Home_page', **food_app()}, c.vis, c.dev))
+                    time.sleep(0.3 + random.random() * 0.3)
+                    c.et('et_impressions', all_pairs)
 
             # Check max_requests limit
             if c.noon_req >= max_requests:
