@@ -122,20 +122,22 @@ def ev_whoami_ab_config(zh, v, i):
     elif isinstance(raw, list): ids = [x for x in raw if isinstance(x, int) and not isinstance(x, bool)]
     return evt('whoami_ab_config', {'abIds': ids or [1052, 1471, 1531, 1731, 1750], **noon_app()}, v, i)
 def ev_page_catalog(pn, v, i): return evt('page_catalog', {'hid': str(uuid.uuid4()), 'nbh': 60, 'pn': pn, 'sb': 'browse', **food_app()}, v, i)
-def impression_triplets(outlets, v, i):
-    events = []
+def impression_pairs(outlets, v, i):
+    """Build outlet_impression_v2 + outlet_impression pairs, matching real app pattern.
+    Returns list of batches (each batch = one etracker POST of 2-5 events)."""
+    pairs = []
     for idx, o in enumerate(outlets):
         oc = o.get('outletCode'); df = o.get('distance') or 5.0; sla = o.get('sla') or '30-40'
-        events.append(evt('outlet_impression', {'oc': oc, 'wid': f'search_outlet/{idx}', 'aid': oc, 'ix': f'0/{idx}', 'otg': False,
-                          'df': df, 'fav': False, 'isp': True, 'sla': sla, 'wn': 'search_results', 'wtc': 'search_results_tab',
-                          'curl': '/search?type=outlet', 'src': 'search/results', 'pn': 'Search_Results', **food_app()}, v, i))
-        events.append(evt('outlet_impression_v2', {'pg': 'SR', 'wt': f'SR/search_results/0/search_results_tab/{idx}/ROW/{idx}/ITM/0',
-                          'ul': '/search?type=outlet', 'cf': '{}', 'isp': True, 'oc': oc, 'df': df, 'sla': sla, **food_app()}, v, i))
-        events.append(evt('promotion_impression', {'aid': oc, 'wid': f'search_results/{idx}', 'aidMap': {oc: f'search_results/{idx}'},
-                          'ismMap': {oc: True}, 'curl': '/search?type=outlet', 'toUrl': f'/outlet/{oc}',
-                          'ed': {'eIds': [], 'reqId': str(uuid.uuid4())}, 'cmsEids': {}, 'wp': idx, 'ar': 100,
-                          'adType': 'display', 'isAd': False, **food_app()}, v, i))
-    return events
+        pairs.append(evt('outlet_impression_v2', {'pg': 'SR', 'wt': f'SR/search_results/0/search_results_tab/{idx}/ROW/{idx}/ITM/0',
+                          'ul': '/search?type=outlet', 'cf': '{}', 'oc': oc, 'df': df, 'sla': sla, **food_app()}, v, i))
+        pairs.append(evt('outlet_impression', {'aid': oc, 'wid': f'search_outlet/{idx}', 'oc': oc, 'ix': f'0/{idx}',
+                          'df': df, 'fav': False, 'isp': False, 'sla': sla,
+                          'curl': '/search?type=outlet', 'pn': 'Home_page', **food_app()}, v, i))
+    # Split into batches of 4-5 events (2-3 outlets per POST), matching real app
+    batches = []
+    for j in range(0, len(pairs), 5):
+        batches.append(pairs[j:j+5])
+    return batches
 
 # -- Supabase (lab RPCs) ----------------------------------------------------------
 
@@ -535,13 +537,20 @@ def scrape_area(claim, ctx):
             if not j.get('searchToken'): stop_reason = f'no-token@{pages_done}'; break
             token = j['searchToken']
 
-            # Telemetry after each page (configurable)
+            # Telemetry after each page — staggered like real app:
+            #   POST 1: page_catalog (1 event)
+            #   POST 2: outlet_impression_v2 + outlet_impression pairs (5 events)
+            #   POST 3: more pairs (5 events)
+            #   POST 4: final pairs (2 events)
+            #   Each POST separated by 0.2-0.5s
             if send_etracker:
                 c.et('et_page_catalog', [ev_page_catalog(pages_done, c.vis, c.dev)])
                 visible = outlets[:imp_n]
                 if visible:
-                    time.sleep(0.1 + random.random() * 0.2)
-                    c.et('et_impressions', impression_triplets(visible, c.vis, c.dev))
+                    batches = impression_pairs(visible, c.vis, c.dev)
+                    for bi, batch in enumerate(batches):
+                        time.sleep(0.2 + random.random() * 0.3)
+                        c.et(f'et_imp_{bi}', batch)
 
             # Check max_requests limit
             if c.noon_req >= max_requests:
