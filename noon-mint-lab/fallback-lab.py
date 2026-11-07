@@ -321,7 +321,7 @@ def scrape_area(claim, ctx):
             'remints_429': state['remints_429'], 'remint429_ok': state['remint429_ok'],
             'after_remint429': state['after_remint429'],
             'et_posts': c.et_posts, 'et_events': c.et_events, 'et_non2xx': c.et_non2xx,
-            'persona': ctx['persona'], 'pace': f"{pace_lo}-{pace_hi}",
+            'persona': ctx['persona'], 'pace': f"{page_gap_lo}-{page_gap_hi}",
             'flow': 'fallback-lab', 'http_protocol': 'curl_cffi_safari15_3',
             'cookies': c.log,  # full request log: every request with step, status, ms, timestamp
         }
