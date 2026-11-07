@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 // noon/uae/ranking-scrape.js — PRODUCTION (v3 network layer + v1 output)
+// WARM-UP (2026-11-07): before the machine's first mint, a TLS handshake to mobile-sentry.noon.team
+//   and GET etracker.noon.com/init, then a 1.8–2.6s pause (scrape_spec.warmup in Supabase).
 // MINT v4 (2026-11-01): 1-call mint (st whoami) with zone headers from noon_lab.mint_zone_cache via claim;
 //   swap-and-retry on blocked identity calls; no token refresh; area 2 skips set-location when cached.
 //   Cache miss → full 4-call mint with swap-and-retry. Lab-tested as noon-mint-lab/ranking-candidate.js.
@@ -199,6 +201,9 @@ const DEFAULT_SPEC = {
   token_refresh: { enabled: true, at_ms_min: 210000, at_ms_max: 260000 },
   on_search_block: { enabled: true, strategies: ['swap_device_id'], max_attempts: 3, backoff_ms: 2000 },
   periodic_identity_rotation: { enabled: false, every_pages: null, at_pages: [], field: 'device' },
+  // WARM-UP (2026-11-07): what the app does at launch before its first whoami.
+  // TLS handshake to mobile-sentry (no request sent) + GET etracker /init, then a short pause.
+  warmup: { enabled: false, sentry: true, etracker_init: true, gap_ms_min: 1800, gap_ms_max: 2600 },
 };
 
 function mergeSpec(defaults, spec) {
@@ -234,6 +239,23 @@ const SET_LOCATION_URL = 'https://api-app.noon.com/_vs/st/mp-identity-api-geo/se
 const FD_WHOAMI_URL = 'https://api-app-fd.noon.com/_svc/mp-food-api-catalog/api/customer/whoami';
 const SEARCH_URL = 'https://api-app-fd.noon.com/_svc/mp-food-api-catalog/api/search';
 const ETRACKER_URL = 'https://etracker.noon.com/track/v2/';
+const ETRACKER_INIT_URL = 'https://etracker.noon.com/init';
+const SENTRY_HOST = 'mobile-sentry.noon.team';
+
+// Warm-up: TCP+TLS handshake to mobile-sentry like the app's first connection at launch.
+// No HTTP request is sent. Never throws; returns 'ok' or a short error.
+function sentryHandshake(timeoutMs = 10000) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v, s) => { if (done) return; done = true; try { s && s.destroy(); } catch (_) {} resolve(v); };
+    try {
+      const s = require('node:tls').connect({ host: SENTRY_HOST, port: 443, servername: SENTRY_HOST, ALPNProtocols: ['h2', 'http/1.1'] });
+      s.setTimeout(timeoutMs, () => finish('err:timeout', s));
+      s.once('secureConnect', () => finish('ok', s));
+      s.once('error', (e) => finish(`err:${String(e.code || e.message).slice(0, 40)}`, s));
+    } catch (e) { finish(`err:${String(e.message).slice(0, 40)}`); }
+  });
+}
 
 // -- etracker events (v3 verbatim — schemas from the iPhone Proxyman trace) ---
 
@@ -726,6 +748,23 @@ function parseCards(outlets, nonFoodSet) {
 
     try {
       if (areaIdx === 0) {
+        // --- WARM-UP before the first mint (spec.warmup, controlled in Supabase) ---
+        if (SPEC.warmup && SPEC.warmup.enabled) {
+          const w0 = Date.now();
+          let sentry = 'skipped', init = 'skipped';
+          if (SPEC.warmup.sentry !== false) {
+            sentry = await sentryHandshake();
+            logReq({ step: 'warmup_sentry', st: sentry === 'ok' ? 'ok' : null, ms: Date.now() - w0, err: sentry === 'ok' ? undefined : sentry });
+          }
+          if (SPEC.warmup.etracker_init !== false) {
+            const ri = curlCall('warmup_etracker_init', ETRACKER_INIT_URL, {
+              headers: { 'User-Agent': UA, Accept: '*/*', Connection: 'keep-alive' }, cookieJar: jar });
+            init = ri.status;
+          }
+          const gap = randInt(Number(SPEC.warmup.gap_ms_min) || 1800, Math.max(Number(SPEC.warmup.gap_ms_min) || 1800, Number(SPEC.warmup.gap_ms_max) || 2600));
+          say(`WARM-UP: sentry=${sentry} etracker_init=${init} | pause ${gap}ms before mint`);
+          await sleep(gap);
+        }
         // --- 4-call mint with telemetry (v3 verbatim) ---
         say(`MINT start (${zoneCached ? '1-call, zone headers from cache' : 'FULL — no cached zone headers'}): device=${shortId(deviceId)} visitor=${shortId(visitorId)} ip=${RUNNER_IP || '?'}`);
         let r = await mintCall('mint_whoami', WHOAMI_URL, () => ({
