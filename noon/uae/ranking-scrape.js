@@ -677,7 +677,8 @@ function parseCards(outlets, nonFoodSet) {
     const areaName = claim.area_name || String(areaId);
     const lat = Number(claim.lat), lng = Number(claim.lng);
     const maxPages = Number(claim.max_pages) || 120;
-    const stopAtMs = claim.deadline_at ? Date.parse(claim.deadline_at) - DEADLINE_MARGIN_MS : null;
+    const marginMs = claim.deadline_margin_s != null ? Number(claim.deadline_margin_s) * 1000 : DEADLINE_MARGIN_MS;  // settings.worker_deadline_margin_s
+    const stopAtMs = claim.deadline_at ? Date.parse(claim.deadline_at) - marginMs : null;
     const pastDeadline = () => stopAtMs != null && Date.now() >= stopAtMs;
     if (claim.gap_seconds > 0) await sleep(claim.gap_seconds * 1000);
     if (STOPPED) { exitReason = 'stopped'; break; }
