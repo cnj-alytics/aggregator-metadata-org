@@ -462,7 +462,8 @@ def scrape_area(claim, ctx):
     dev_start = c.dev
     imp_n = int(ctx.get('impressions_per_page') or 6)
     # Hard stop at the run deadline (:55): stop paging DEADLINE_MARGIN_S early and save what is scraped.
-    try: stop_at = datetime.fromisoformat(str(claim.get('deadline_at')).replace('Z', '+00:00')).timestamp() - DEADLINE_MARGIN_S
+    margin_s = float(claim['deadline_margin_s']) if claim.get('deadline_margin_s') is not None else DEADLINE_MARGIN_S  # settings.worker_deadline_margin_s
+    try: stop_at = datetime.fromisoformat(str(claim.get('deadline_at')).replace('Z', '+00:00')).timestamp() - margin_s
     except Exception: stop_at = None
     def past_deadline(): return stop_at is not None and time.time() >= stop_at
 
