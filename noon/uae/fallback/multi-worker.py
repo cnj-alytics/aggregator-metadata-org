@@ -35,7 +35,7 @@ GH_RUN_ID = os.environ.get('GITHUB_RUN_ID', '')
 WORKER_COUNT = int(os.environ.get('WORKER_COUNT') or 6)
 WALL_LIMIT_S = int(os.environ.get('WALL_LIMIT_SEC') or 3600)
 DC_PROXY_BASE = os.environ.get('NOON_PROXY_URL_DC', '').rstrip('/')  # no port
-DC_PORT_BASE = 10001
+DC_PORT_BASE = 10001  # default; settings.fb_dc_port_base wins (read in dc_slot)
 
 START = time.time()
 
@@ -73,9 +73,15 @@ def dc_slot():
     own = rows[nos.index(MACHINE_NO)].get('proxy_port')
     if own:
         return int(own), len(nos)
-    st = (_req('GET', '/rest/v1/noon_ranking_settings?id=eq.1&select=fb_dc_machines') or [{}])[0]
+    st = _settings()
     fleet_size = int(st.get('fb_dc_machines') or len(nos) or 1)
     return (nos.index(MACHINE_NO) % fleet_size) + 1, len(nos)
+
+def _settings():
+    try:
+        return (_req('GET', '/rest/v1/noon_ranking_settings?id=eq.1&select=*') or [{}])[0]
+    except Exception:
+        return {}
 
 def ip_pages_per_min():
     try:
@@ -125,7 +131,8 @@ def main():
     slot, n_dc = dc_slot()
     if slot is None:
         say(f'machine {MACHINE_NO} is not a DC machine of run {RUN_ID} ({n_dc} DC rows) - exiting'); sys.exit(1)
-    port_start = DC_PORT_BASE + (slot - 1) * WORKER_COUNT
+    port_base = int(_settings().get('fb_dc_port_base') or DC_PORT_BASE)
+    port_start = port_base + (slot - 1) * WORKER_COUNT
     ports = list(range(port_start, port_start + WORKER_COUNT))
     say(f'DC slot {slot}/{n_dc} -> {WORKER_COUNT} workers on ports {ports[0]}-{ports[-1]}')
     say(f'proxy host: {DC_PROXY_BASE.split("@")[-1]}')
