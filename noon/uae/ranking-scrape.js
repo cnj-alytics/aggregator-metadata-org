@@ -90,13 +90,34 @@ const CI_URL = `https://github.com/lwthiker/curl-impersonate/releases/download/$
 const CI_DIR = '/tmp/curl-impersonate';
 const WRAPPER = process.env.IMPERSONATE_WRAPPER || 'curl_safari15_3';
 
+// ROBUST (2026-11-08): GitHub release downloads failed on and off from 13:01 (502s, 20-30 s
+// responses) and every machine that missed it died at boot. Now: a copy bundled in the repo
+// (noon/uae/vendor/) is used first; otherwise the download is retried for up to ~3 minutes.
+const CI_BUNDLED = require('node:path').join(__dirname, 'vendor', `curl-impersonate-${CI_VERSION}.x86_64-linux-gnu.tar.gz`);
+
 function ensureCurl() {
   for (const c of [WRAPPER, `/opt/ci/${WRAPPER}`, `${CI_DIR}/${WRAPPER}`]) {
     try { execFileSync(c, ['--version'], { stdio: 'ignore', timeout: 10000 }); return c; } catch (_) {}
   }
   fs.mkdirSync(CI_DIR, { recursive: true });
-  execFileSync('curl', ['-sSL', '--fail', '--max-time', '120', '-o', `${CI_DIR}/ci.tar.gz`, CI_URL], { timeout: 130000 });
-  execFileSync('tar', ['-xzf', `${CI_DIR}/ci.tar.gz`, '-C', CI_DIR], { timeout: 60000 });
+  const tgz = `${CI_DIR}/ci.tar.gz`;
+  if (fs.existsSync(CI_BUNDLED)) {
+    fs.copyFileSync(CI_BUNDLED, tgz);
+  } else {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      try {
+        execFileSync('curl', ['-sSL', '--fail', '--connect-timeout', '15', '--max-time', '45', '-o', tgz, CI_URL], { timeout: 55000 });
+        lastErr = null; break;
+      } catch (e) {
+        lastErr = e;
+        console.error(`curl-impersonate download attempt ${attempt}/6 failed: ${String(e.message).slice(0, 120)}`);
+        if (attempt < 6) execFileSync('sleep', [String(Math.min(5 * attempt, 20) + Math.floor(Math.random() * 5))]);
+      }
+    }
+    if (lastErr) throw lastErr;
+  }
+  execFileSync('tar', ['-xzf', tgz, '-C', CI_DIR], { timeout: 60000 });
   const p = `${CI_DIR}/${WRAPPER}`;
   execFileSync(p, ['--version'], { stdio: 'ignore', timeout: 10000 });
   return p;
